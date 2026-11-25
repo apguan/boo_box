@@ -1,0 +1,214 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+boo — boo_box CLI for isolated APFS sandboxes and the shared global sandbox env
+
+Sandbox Sessions:
+  boo                         Clone current directory into a sandbox (or scratch if in ~ / /)
+  boo .                       Clone current directory (all files incl. node_modules, 0 extra SSD bytes)
+  boo <dir>                   Clone <dir> into an isolated APFS sandbox session
+  boo --no-env [dir]          Exclude .env / .env.* secret files when cloning
+  boo --slim [dir]            Skip node_modules & gitignored build caches for faster cold clone
+  boo --full [dir]            Clone all files including node_modules & build caches (default)
+  boo --scratch               Open a fresh empty scratch sandbox session
+
+Global Sandbox Environment (~/boo_box/env — shared across all sessions):
+  boo env run '<script>'      Run any install script inside Seatbelt with HOME=~/boo_box/env
+  boo env shell               Open a sandboxed shell targeting ~/boo_box/env (install anything)
+  boo tools [--json]          List installed toolchains & binaries by directory path
+  boo env rm <dir-path>       Remove a toolchain directory inside ~/boo_box/env
+  boo env path                Print the global sandbox env root path
+  boo env reset               Wipe and recreate ~/boo_box/env cleanly
+  boo -h, --help              Show this help
+EOF
+}
+
+resolve_app() {
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+    local candidates=()
+    if [ -n "${BOOBOX_APP_PATH:-}" ]; then
+        candidates+=("$BOOBOX_APP_PATH")
+    fi
+    if [ -f "$HOME/boo_box/.app-path" ]; then
+        local recorded
+        recorded="$(cat "$HOME/boo_box/.app-path" 2>/dev/null || true)"
+        if [ -n "$recorded" ]; then
+            candidates+=("$recorded")
+        fi
+    fi
+    candidates+=(
+        "$script_dir/../build/boo_box.app"
+        "/Applications/boo_box.app"
+        "$HOME/Applications/boo_box.app"
+    )
+    for app in "${candidates[@]}"; do
+        if [ -d "$app" ]; then
+            echo "$app"
+            return 0
+        fi
+    done
+    local spotlight
+    spotlight="$(mdfind 'kMDItemCFBundleIdentifier == "dev.boo-box.app"' 2>/dev/null | head -n 1 || true)"
+    if [ -n "$spotlight" ] && [ -d "$spotlight" ]; then
+        echo "$spotlight"
+        return 0
+    fi
+    echo "boo: boo_box.app not found (build with ./scripts/bundle-app.sh or set BOOBOX_APP_PATH)" >&2
+    exit 1
+}
+url_encode() {
+    local LC_ALL=C str="$1" i c out=""
+    for (( i = 0; i < ${#str}; i++ )); do
+        c="${str:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Route global sandbox environment subcommands directly to boobox-env
+case "${1:-}" in
+    install|run|tools|ls|list|env)
+        APP_PATH="$(resolve_app)"
+        ENV_BIN="$APP_PATH/Contents/Resources/bin/boobox-env"
+        if [ ! -x "$ENV_BIN" ]; then
+            SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+            ENV_BIN="$SCRIPT_DIR/boobox-env"
+        fi
+        exec "$ENV_BIN" "$@"
+        ;;
+esac
+NO_ENV=0
+CLONE_MODE=""   # "" = follow config.json (default full), "full", or "slim"
+SCRATCH=0
+TARGET=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --no-env)
+            NO_ENV=1
+            shift
+            ;;
+        --full)
+            CLONE_MODE="full"
+            shift
+            ;;
+        --slim)
+            CLONE_MODE="slim"
+            shift
+            ;;
+        --scratch)
+            SCRATCH=1
+            shift
+            ;;
+        --)
+            shift
+            if [ $# -gt 0 ]; then
+                TARGET="$1"
+                shift
+            fi
+            ;;
+        -*)
+            echo "boo: unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            TARGET="$1"
+            shift
+            ;;
+    esac
+done
+
+APP_PATH="$(resolve_app)"
+CLONE_BIN="$APP_PATH/Contents/MacOS/boobox-clone"
+SOCK_PATH="$HOME/boo_box/run/app.sock"
+
+if [ "$SCRATCH" -eq 1 ]; then
+    if [ -S "$SOCK_PATH" ] && "$CLONE_BIN" --ipc-send "$SOCK_PATH" '{"op":"scratch"}' 2>/dev/null; then
+        exit 0
+    fi
+    open -a "$APP_PATH" --args --scratch
+    exit 0
+fi
+
+# If invoked bare (`boo`) inside a project directory (not ~, /, /Users, or ~/boo_box), default to $PWD
+if [ -z "$TARGET" ]; then
+    REAL_PWD="$(pwd -P)"
+    REAL_HOME="$(cd "$HOME" && pwd -P)"
+    if [ "$REAL_PWD" = "/" ] || [ "$REAL_PWD" = "/Users" ] || [ "$REAL_PWD" = "$REAL_HOME" ] || [ "$REAL_PWD" = "$REAL_HOME/boo_box" ] || [[ "$REAL_PWD" == "$REAL_HOME/boo_box/"* ]]; then
+        if [ -S "$SOCK_PATH" ] && "$CLONE_BIN" --ipc-send "$SOCK_PATH" '{"op":"activate"}' 2>/dev/null; then
+            exit 0
+        fi
+        open -a "$APP_PATH"
+        exit 0
+    fi
+    TARGET="$REAL_PWD"
+fi
+
+if [ ! -d "$TARGET" ]; then
+    echo "boo: not a directory: $TARGET" >&2
+    exit 1
+fi
+ABS_DIR="$(cd "$TARGET" && pwd -P)"
+PROJ_NAME="$(basename "$ABS_DIR")"
+
+# Pop from warm APFS pool + Git/lockfile delta-sync (zero python3, <1 ms Unix socket handoff to running boo_box)
+SESS_UUID="$(/usr/bin/uuidgen)"
+SHORT_ID="s-$(printf '%s' "${SESS_UUID:0:8}" | tr '[:upper:]' '[:lower:]')"
+SESS_DIR="$HOME/boo_box/sessions/$SHORT_ID"
+WS_DIR="$SESS_DIR/workspace"
+SESS_META="$SESS_DIR/.clone-meta.json"
+mkdir -p "$SESS_DIR"
+
+PATH_HASH="$(printf '%s' "$ABS_DIR" | /usr/bin/shasum -a 256)"
+PATH_HASH="${PATH_HASH:0:10}"
+TMPL_KEY="${PROJ_NAME}-${PATH_HASH}"
+TMPL_DIR="$HOME/boo_box/templates/$TMPL_KEY"
+WARM_DIR="$HOME/boo_box/templates/.warm-$TMPL_KEY"
+WARM_META="$HOME/boo_box/templates/.warm-meta-$TMPL_KEY.json"
+
+CLONE_ARGS=(
+    "$ABS_DIR" "$WS_DIR"
+    --use-config "$HOME/boo_box/config.json"
+    --write-meta "$SESS_META"
+    --warm-pop "$WARM_DIR"
+    --warm-meta "$WARM_META"
+    --notify-socket "$SOCK_PATH"
+    --notify-id "$SESS_UUID"
+    --notify-name "$PROJ_NAME"
+    --notify-template "$TMPL_DIR"
+)
+if [ "$NO_ENV" -eq 1 ]; then CLONE_ARGS+=(--no-env); fi
+if [ "$CLONE_MODE" = "full" ]; then CLONE_ARGS+=(--full); fi
+if [ "$CLONE_MODE" = "slim" ]; then CLONE_ARGS+=(--slim); fi
+
+if [ ! -d "$WARM_DIR" ] || [ ! -f "$WARM_META" ]; then
+    printf 'boo_box: cloning %s into %s (zero-copy APFS; future runs pop warm pool)...\n' "$PROJ_NAME" "$SHORT_ID"
+fi
+
+RC=0
+"$CLONE_BIN" "${CLONE_ARGS[@]}" || RC=$?
+if [ "$RC" -eq 0 ]; then
+    exit 0
+elif [ "$RC" -eq 10 ]; then
+    # Cloned cleanly, app was not running yet -> cold launch boo_box.app
+    if [ "$NO_ENV" -eq 1 ]; then
+        open -a "$APP_PATH" --args --ready-session "$SESS_UUID" --name "$PROJ_NAME" --template "$TMPL_DIR" --no-env
+    else
+        open -a "$APP_PATH" --args --ready-session "$SESS_UUID" --name "$PROJ_NAME" --template "$TMPL_DIR"
+    fi
+    exit 0
+else
+    rm -rf "$SESS_DIR"
+    exit "$RC"
+fi

@@ -1,0 +1,15 @@
+{
+  "originHash" : "68a7e99e8860ec7a0d7f65cf0db85197ddcb5a8e2dfc5d83857cc4982d9591d4",
+  "pins" : [
+    {
+      "identity" : "ghosttykit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/loeschg/GhosttyKit",
+      "state" : {
+        "revision" : "b4392538cd87b8121fa081f9e3dd1a4dfd5a3d01",
+        "version" : "1.4.0"
+      }
+    }
+  ],
+  "version" : 3
+}

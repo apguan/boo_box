@@ -1,0 +1,469 @@
+#!/bin/bash
+set -euo pipefail
+
+# boobox-env — simple, sandboxed global toolchain store for boo_box (~/boo_box/env)
+#
+# Run ANY install script (curl | sh, npm i -g, bun add -g, uv tool install, go install,
+# cargo install, tar -xz, etc.) inside a Seatbelt sandbox where HOME=~/boo_box/env.
+# Everything downloads into ~/boo_box/env (real Mac files are kernel-denied), and every
+# directory containing executables under ~/boo_box/env is automatically discovered,
+# listed by directory path, and exposed on PATH across all sandbox sessions.
+
+resolve_python() {
+    for py in /Library/Developer/CommandLineTools/usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if [ -x "$py" ]; then
+            printf '%s' "$py"
+            return 0
+        fi
+    done
+    command -v python3
+}
+
+PY_BIN="$(resolve_python)"
+REAL_HOME="$(cd ~ && pwd -P)"
+
+resolve_env_root() {
+    if [ -n "${BOOBOX_ENV:-}" ]; then
+        printf '%s' "$BOOBOX_ENV"
+        return 0
+    fi
+    if [ -f "$REAL_HOME/boo_box/config.json" ]; then
+        local configured
+        configured="$("$PY_BIN" -c '
+import json, os, pathlib
+try:
+    p = json.loads((pathlib.Path.home() / "boo_box/config.json").read_text()).get("sandboxAccess", {}).get("sandboxToolsPath", "")
+    if p:
+        print(os.path.realpath(os.path.expanduser(p)))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+        if [ -n "$configured" ]; then
+            printf '%s' "$configured"
+            return 0
+        fi
+    fi
+    printf '%s' "$REAL_HOME/boo_box/env"
+}
+
+ENV_ROOT="$(resolve_env_root)"
+
+ensure_layout() {
+    mkdir -p \
+        "$ENV_ROOT/.boobox-bin" \
+        "$ENV_ROOT/bin" \
+        "$ENV_ROOT/.local/bin" \
+        "$ENV_ROOT/.npm-global/bin" \
+        "$ENV_ROOT/.bun/bin" \
+        "$ENV_ROOT/.local/share/pnpm" \
+        "$ENV_ROOT/.cargo/bin" \
+        "$ENV_ROOT/go/bin" \
+        "$ENV_ROOT/.config" \
+        "$ENV_ROOT/.cache" \
+        "$ENV_ROOT/.tmp"
+    if [ ! -x "$ENV_ROOT/.boobox-bin/mktemp" ]; then
+        cat > "$ENV_ROOT/.boobox-bin/mktemp" <<'SHIM'
+#!/bin/sh
+has_p=0; has_t=0; has_pos=0; skip_next=0; after_dd=0
+for arg in "$@"; do
+    if [ "$after_dd" -eq 1 ]; then has_pos=1; continue; fi
+    if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+    case "$arg" in
+        --) after_dd=1 ;;
+        -p|--tmpdir|--tmpdir=*) has_p=1; [ "$arg" = "-p" ] && skip_next=1 ;;
+        -t|-[a-zA-Z]*t) has_t=1; skip_next=1 ;;
+        -t*) has_t=1 ;;
+        -*) ;;
+        *) has_pos=1 ;;
+    esac
+done
+if [ "$has_p" -eq 0 ] && [ -n "${TMPDIR:-}" ] && { [ "$has_pos" -eq 0 ] || [ "$has_t" -eq 1 ]; }; then
+    exec /usr/bin/mktemp -p "$TMPDIR" "$@"
+fi
+exec /usr/bin/mktemp "$@"
+SHIM
+        chmod 555 "$ENV_ROOT/.boobox-bin/mktemp"
+    fi
+}
+
+discover_dirs_json() {
+    ensure_layout
+    ENV_ROOT="$ENV_ROOT" REAL_HOME="$REAL_HOME" "$PY_BIN" -c '
+import json, os, pathlib
+
+env_root = pathlib.Path(os.environ["ENV_ROOT"]).resolve()
+real_home = os.environ["REAL_HOME"]
+
+skip_dirs = {
+    "node_modules", ".git", ".tmp", ".cache", "cache", "state", ".boobox-bin",
+    "__pycache__", "site-packages", "include", "man", "doc", "docs",
+    "test", "tests", "pkg", "src", "share", "lib", "libexec",
+}
+skip_bins = {"boo"}
+
+def is_exec_file(p: pathlib.Path) -> bool:
+    try:
+        if p.is_dir():
+            return False
+        st = os.stat(p)
+        return bool(st.st_mode & 0o111)
+    except OSError:
+        return False
+
+def display_path(p: str) -> str:
+    if p == real_home:
+        return "~"
+    if p.startswith(real_home + "/"):
+        return "~/" + p[len(real_home) + 1:]
+    return p
+
+found = {}
+
+def walk(cur: pathlib.Path, depth: int):
+    if depth > 4:
+        return
+    try:
+        entries = sorted(cur.iterdir(), key=lambda x: x.name)
+    except OSError:
+        return
+
+    name = cur.name
+    is_bin_dir = (name in ("bin", "shims", "pnpm")) and cur != env_root
+    is_tool_dir = (depth in (1, 2)) and cur != env_root and not name.startswith(".tmp")
+
+    bins = []
+    subdirs = []
+    for e in entries:
+        en = e.name
+        if en.startswith(".") and depth > 1 and en not in (".bin",):
+            continue
+        if e.is_dir() and not e.is_symlink():
+            if en not in skip_dirs:
+                subdirs.append(e)
+        else:
+            if (is_bin_dir or is_tool_dir) and en not in skip_bins and not en.startswith("."):
+                if is_exec_file(e):
+                    bins.append(en)
+
+    if bins:
+        pstr = str(cur)
+        found[pstr] = sorted(set(bins))
+
+    for d in subdirs:
+        walk(d, depth + 1)
+
+walk(env_root, 0)
+
+directories = []
+for pstr in sorted(found.keys()):
+    directories.append({
+        "path": pstr,
+        "displayPath": display_path(pstr),
+        "binaries": found[pstr],
+    })
+
+print(json.dumps({
+    "envRoot": str(env_root),
+    "displayRoot": display_path(str(env_root)),
+    "directories": directories,
+}))
+'
+}
+
+build_installer_path() {
+    local discovered
+    discovered="$(discover_dirs_json | "$PY_BIN" -c 'import json,sys; d=json.load(sys.stdin); print(":".join(x["path"] for x in d["directories"]))')"
+    local parts="$ENV_ROOT/.boobox-bin:$ENV_ROOT/bin:$ENV_ROOT/.local/bin:$ENV_ROOT/.npm-global/bin:$ENV_ROOT/.bun/bin:$ENV_ROOT/.local/share/pnpm:$ENV_ROOT/.cargo/bin:$ENV_ROOT/go/bin"
+    if [ -n "$discovered" ]; then
+        parts="$discovered:$parts"
+    fi
+    # Include host read-only toolchains (fnm/nvm Node, bun, uv, homebrew, CLT) so curl/npm/bun/uv/tar/clang work in scripts
+    for fnm_root in "$REAL_HOME/.local/share/fnm/node-versions" "$REAL_HOME/Library/Application Support/fnm/node-versions"; do
+        if [ -d "$fnm_root" ]; then
+            local latest_fnm
+            latest_fnm="$(ls -1 "$fnm_root" 2>/dev/null | sort -r | head -n 1 || true)"
+            if [ -n "$latest_fnm" ] && [ -d "$fnm_root/$latest_fnm/installation/bin" ]; then
+                parts="$parts:$fnm_root/$latest_fnm/installation/bin"
+                break
+            fi
+        fi
+    done
+    parts="$parts:$REAL_HOME/.local/bin:$REAL_HOME/.bun/bin:$REAL_HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    printf '%s' "$parts"
+}
+
+write_installer_sbpl() {
+    local sb_path="$1"
+    local cache_dir="$REAL_HOME/boo_box/cache"
+    local cache_rules=""
+    if [ -d "$cache_dir" ]; then
+        cache_rules="    (subpath \"$cache_dir\")"
+    fi
+    cat > "$sb_path" <<EOF
+(version 1)
+(allow default)
+
+;; Isolate installer script strictly to $ENV_ROOT (cannot read or write Desktop, Documents, ~/.ssh, or real repos)
+(deny file-read*
+    (subpath "/Users")
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders")
+    (subpath "/Volumes")
+)
+(deny file-test-existence
+    (subpath "/Users")
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders")
+    (subpath "/Volumes")
+)
+
+(allow file-read-metadata file-test-existence
+    (literal "/Users")
+    (literal "$REAL_HOME")
+    (literal "$REAL_HOME/boo_box")
+    (literal "$REAL_HOME/Library")
+    (literal "$REAL_HOME/Library/Application Support")
+    (literal "$REAL_HOME/.local")
+    (literal "$REAL_HOME/.local/share")
+    (literal "$REAL_HOME/.cargo")
+    (literal "$REAL_HOME/.bun")
+)
+
+(allow file-read* file-test-existence
+    (subpath "$ENV_ROOT")
+$cache_rules
+    (subpath "$REAL_HOME/.cargo/bin")
+    (subpath "$REAL_HOME/.rustup")
+    (subpath "$REAL_HOME/.bun/bin")
+    (subpath "$REAL_HOME/.local/bin")
+    (subpath "$REAL_HOME/.local/share/fnm")
+    (subpath "$REAL_HOME/.local/share/uv")
+    (subpath "$REAL_HOME/.fnm")
+    (subpath "$REAL_HOME/.nvm")
+    (subpath "$REAL_HOME/Library/Application Support/fnm")
+)
+
+(deny file-write*)
+(allow file-write*
+    (subpath "$ENV_ROOT")
+$cache_rules
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/tty")
+    (literal "/dev/ptmx")
+    (literal "/dev/dtracehelper")
+    (regex #"^/dev/ttys[0-9]+$")
+    (regex #"^/dev/pty.*$")
+)
+(deny file-write*
+    (literal "$sb_path")
+)
+EOF
+}
+
+run_in_env_sandbox() {
+    local mode="$1"  # "script" or "shell"
+    shift || true
+    ensure_layout
+
+    local inst_path
+    inst_path="$(build_installer_path)"
+
+    local env_args=(
+        "TERM=${TERM:-xterm-256color}"
+        "SHELL=/bin/zsh"
+        "npm_config_script_shell=/bin/sh"
+        "HOME=$ENV_ROOT"
+        "ZDOTDIR=$ENV_ROOT"
+        "TMPDIR=$ENV_ROOT/.tmp"
+        "TMPPREFIX=$ENV_ROOT/.tmp/zsh"
+        "XDG_CONFIG_HOME=$ENV_ROOT/.config"
+        "XDG_DATA_HOME=$ENV_ROOT/.local/share"
+        "XDG_CACHE_HOME=$ENV_ROOT/.cache"
+        "BOOBOX_ENV=$ENV_ROOT"
+        "BOOBOX_TOOLS_DIR=$ENV_ROOT"
+        "PREFIX=$ENV_ROOT"
+        "npm_config_prefix=$ENV_ROOT/.npm-global"
+        "BUN_INSTALL=$ENV_ROOT/.bun"
+        "PNPM_HOME=$ENV_ROOT/.local/share/pnpm"
+        "PYTHONUSERBASE=$ENV_ROOT/.local"
+        "UV_TOOL_DIR=$ENV_ROOT/.local/share/uv/tools"
+        "UV_TOOL_BIN_DIR=$ENV_ROOT/.local/bin"
+        "UV_PYTHON_INSTALL_DIR=$ENV_ROOT/.local/share/uv/python"
+        "UV_PYTHON_BIN_DIR=$ENV_ROOT/.local/bin"
+        "GOPATH=$ENV_ROOT/go"
+        "CARGO_HOME=$ENV_ROOT/.cargo"
+        "CARGO_INSTALL_ROOT=$ENV_ROOT/.cargo"
+        "RUSTUP_HOME=$ENV_ROOT/.rustup"
+        "DENO_INSTALL=$ENV_ROOT/.deno"
+        "PATH=$inst_path"
+    )
+    if [ -d "$REAL_HOME/boo_box/cache" ]; then
+        env_args+=(
+            "npm_config_cache=$REAL_HOME/boo_box/cache/npm"
+            "BUN_INSTALL_CACHE_DIR=$REAL_HOME/boo_box/cache/bun"
+            "PNPM_STORE_DIR=$REAL_HOME/boo_box/cache/pnpm"
+            "UV_CACHE_DIR=$REAL_HOME/boo_box/cache/uv"
+            "PIP_CACHE_DIR=$REAL_HOME/boo_box/cache/pip"
+        )
+    fi
+    if [ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk" ]; then
+        env_args+=(
+            "SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+            "DEVELOPER_DIR=/Library/Developer/CommandLineTools"
+        )
+    fi
+
+    cd "$ENV_ROOT"
+
+    # If already inside a boo_box Seatbelt sandbox, run directly with HOME=$ENV_ROOT
+    # (Seatbelt doesn't allow nested sandbox-exec and already seals the rest of the Mac).
+    if [ "${BOOBOX_MODE:-}" = "mac_sandbox" ]; then
+        if [ "$mode" = "shell" ]; then
+            exec /usr/bin/env -i "${env_args[@]}" BOOBOX_MODE="mac_sandbox" /bin/zsh -i
+        else
+            /usr/bin/env -i "${env_args[@]}" BOOBOX_MODE="mac_sandbox" /bin/zsh -c "$1"
+        fi
+    else
+        local sb_file="$ENV_ROOT/.installer.sb"
+        write_installer_sbpl "$sb_file"
+        if [ "$mode" = "shell" ]; then
+            exec /usr/bin/env -i "${env_args[@]}" /usr/bin/sandbox-exec -f "$sb_file" /bin/zsh -i
+        else
+            /usr/bin/env -i "${env_args[@]}" /usr/bin/sandbox-exec -f "$sb_file" /bin/zsh -c "$1"
+        fi
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+boo global sandbox environment (~/boo_box/env — shared across all sandboxes)
+
+Usage:
+  boo env run '<script>'     Run any install script inside a Seatbelt sandbox targeting ~/boo_box/env
+                             Examples:
+                               boo env run 'curl -fsSL https://bun.sh/install | bash'
+                               boo env run 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+                               boo env run 'npm install -g @openai/codex'
+                               boo env run 'uv tool install ruff'
+                               boo env run 'go install golang.org/x/tools/gopls@latest'
+  boo env shell              Open a sandboxed shell where HOME=~/boo_box/env (install anything)
+  boo tools [--json]         List discovered toolchains & binaries by directory path
+  boo env rm <dir-path>      Remove a toolchain directory inside ~/boo_box/env
+  boo env path               Print the global sandbox env root path
+  boo env reset              Wipe and recreate ~/boo_box/env cleanly
+EOF
+}
+
+cmd_tools() {
+    local as_json=0
+    if [ "${1:-}" = "--json" ]; then
+        as_json=1
+    fi
+    local raw
+    raw="$(discover_dirs_json)"
+    if [ "$as_json" -eq 1 ]; then
+        printf '%s\n' "$raw"
+    else
+        printf '%s' "$raw" | "$PY_BIN" -c '
+import json, sys
+d = json.load(sys.stdin)
+dirs = d["directories"]
+print("Global Sandbox Env:", d["displayRoot"])
+print()
+if not dirs:
+    print("No custom toolchains installed yet.")
+    print("Run any install script in sandbox:")
+    print("  boo env run '\''curl -LsSf https://astral.sh/uv/install.sh | sh'\''")
+    print("  boo env run '\''npm install -g @openai/codex'\''")
+else:
+    total = sum(len(x["binaries"]) for x in dirs)
+    print("Discovered %d path(s), %d executable(s) exposed on sandbox PATH:" % (len(dirs), total))
+    print()
+    for entry in dirs:
+        print("  %s" % entry["displayPath"])
+        print("    %s" % ", ".join(entry["binaries"]))
+'
+    fi
+}
+
+cmd_rm() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        echo "Usage: boo env rm <dir-path-inside-env>" >&2
+        exit 2
+    fi
+    ensure_layout
+    local resolved
+    resolved="$("$PY_BIN" -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$target")"
+    local env_real
+    env_real="$("$PY_BIN" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ENV_ROOT")"
+    if [[ "$resolved" != "$env_real/"* ]] || [ "$resolved" = "$env_real/bin" ]; then
+        echo "boo_box: refusing to remove path outside $env_real: $resolved" >&2
+        exit 1
+    fi
+    rm -rf "$resolved"
+    echo "Removed $resolved"
+}
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    tools|ls|list)
+        cmd_tools "$@"
+        ;;
+    install|run)
+        if [ $# -eq 0 ]; then
+            echo "Usage: boo env run '<install script>'" >&2
+            exit 2
+        fi
+        run_in_env_sandbox script "$*"
+        ;;
+    env)
+        SUB="${1:-help}"
+        shift || true
+        case "$SUB" in
+            run|exec|install)
+                if [ $# -eq 0 ]; then
+                    echo "Usage: boo env run '<install script>'" >&2
+                    exit 2
+                fi
+                run_in_env_sandbox script "$*"
+                ;;
+            shell)
+                echo "boo_box sandboxed global env shell (HOME=$ENV_ROOT — host Mac is kernel-denied)."
+                echo "Run any installer (curl | sh, npm i -g, go install, cargo install, uv tool install, etc.)."
+                run_in_env_sandbox shell
+                ;;
+            rm|remove|uninstall)
+                cmd_rm "${1:-}"
+                ;;
+            path)
+                ensure_layout
+                printf '%s\n' "$ENV_ROOT"
+                ;;
+            reset)
+                if [ -d "$ENV_ROOT" ]; then
+                    find "$ENV_ROOT" -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} + 2>/dev/null || true
+                    if [ -d "$ENV_ROOT/bin" ]; then
+                        find "$ENV_ROOT/bin" -mindepth 1 ! -name boo -exec rm -rf {} + 2>/dev/null || true
+                    fi
+                fi
+                ensure_layout
+                echo "Reset global sandbox env at $ENV_ROOT"
+                ;;
+            *)
+                usage
+                ;;
+        esac
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "boo: unknown env command '$CMD'" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
