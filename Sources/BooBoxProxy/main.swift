@@ -245,13 +245,44 @@ private func sendHTTPError(fd: Int32, status: Int, title: String, reasonHeader: 
     _ = writeAll(fd: fd, data: Data(resp.utf8))
 }
 
-private func readHTTPRequest(fd: Int32) -> (method: String, target: String, headers: [(String, String)], body: Data)? {
-    var buffer = Data()
-    var chunk = [UInt8](repeating: 0, count: 8192)
-    let headerSep = Data("\r\n\r\n".utf8)
-    var headerEndRange: Range<Data.Index>? = nil
+private func setSocketNoDelay(_ fd: Int32) {
+    var one: Int32 = 1
+    _ = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+}
 
-    while buffer.count < 256 * 1024 {
+private func setSocketNonBlocking(_ fd: Int32, enabled: Bool) {
+    let flags = fcntl(fd, F_GETFL, 0)
+    guard flags >= 0 else { return }
+    _ = fcntl(fd, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK))
+}
+
+private func waitReadable(fd: Int32, timeoutMs: Int32) -> Bool {
+    var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+    while true {
+        let rc = Darwin.poll(&pfd, 1, timeoutMs)
+        if rc < 0 {
+            if errno == EINTR { continue }
+            return false
+        }
+        return rc > 0 && (pfd.revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0
+    }
+}
+
+private func readHTTPRequest(
+    fd: Int32,
+    leftover: inout Data,
+    idleTimeoutMs: Int32 = 30_000
+) -> (method: String, target: String, version: String, headers: [(String, String)], body: Data)? {
+    var buffer = leftover
+    leftover.removeAll(keepingCapacity: true)
+    var chunk = [UInt8](repeating: 0, count: 16384)
+    let headerSep = Data("\r\n\r\n".utf8)
+    var headerEndRange: Range<Data.Index>? = buffer.range(of: headerSep)
+
+    while headerEndRange == nil && buffer.count < 256 * 1024 {
+        if buffer.isEmpty && !waitReadable(fd: fd, timeoutMs: idleTimeoutMs) {
+            return nil
+        }
         let n = Darwin.read(fd, &chunk, chunk.count)
         if n < 0 {
             if errno == EINTR { continue }
@@ -275,6 +306,7 @@ private func readHTTPRequest(fd: Int32) -> (method: String, target: String, head
 
     let method = String(reqParts[0]).uppercased()
     let target = String(reqParts[1])
+    let version = reqParts.count >= 3 ? String(reqParts[2]).uppercased() : "HTTP/1.1"
     var headers: [(String, String)] = []
     var contentLength = 0
     var isChunked = false
@@ -292,32 +324,39 @@ private func readHTTPRequest(fd: Int32) -> (method: String, target: String, head
         }
     }
 
-    var body = Data(buffer[sep.upperBound...])
+    var bodyBuf = Data(buffer[sep.upperBound...])
+    let body: Data
     if contentLength > 0 {
-        while body.count < contentLength {
-            let toRead = min(chunk.count, contentLength - body.count)
+        while bodyBuf.count < contentLength {
+            let toRead = min(chunk.count, contentLength - bodyBuf.count)
             let n = Darwin.read(fd, &chunk, toRead)
             if n < 0 {
                 if errno == EINTR { continue }
                 break
             }
             if n == 0 { break }
-            body.append(chunk, count: n)
+            bodyBuf.append(chunk, count: n)
         }
-        if body.count > contentLength {
-            body = body.prefix(contentLength)
+        if bodyBuf.count > contentLength {
+            body = Data(bodyBuf.prefix(contentLength))
+            leftover = Data(bodyBuf.dropFirst(contentLength))
+        } else {
+            body = bodyBuf
         }
     } else if isChunked {
-        body = readAndDecodeChunkedBody(fd: fd, initial: body)
+        body = readAndDecodeChunkedBody(fd: fd, buffer: &bodyBuf)
+        leftover = bodyBuf
+    } else {
+        body = Data()
+        leftover = bodyBuf
     }
 
-    return (method, target, headers, body)
+    return (method, target, version, headers, body)
 }
 
-private func readAndDecodeChunkedBody(fd: Int32, initial: Data) -> Data {
-    var raw = initial
+private func readAndDecodeChunkedBody(fd: Int32, buffer raw: inout Data) -> Data {
     var out = Data()
-    var buf = [UInt8](repeating: 0, count: 8192)
+    var buf = [UInt8](repeating: 0, count: 16384)
     let crlf = Data("\r\n".utf8)
 
     func fillMore() -> Bool {
@@ -343,7 +382,19 @@ private func readAndDecodeChunkedBody(fd: Int32, initial: Data) -> Data {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
         raw.removeSubrange(..<lineRange.upperBound)
         guard let size = Int(sizeStr, radix: 16) else { break }
-        if size == 0 { break }
+        if size == 0 {
+            // Drain optional trailing headers + final CRLF so keep-alive framing stays aligned
+            while true {
+                while raw.range(of: crlf) == nil {
+                    if !fillMore() { return out }
+                }
+                guard let endRange = raw.range(of: crlf) else { return out }
+                let isEmptyTrailer = (endRange.lowerBound == raw.startIndex)
+                raw.removeSubrange(..<endRange.upperBound)
+                if isEmptyTrailer { break }
+            }
+            break
+        }
         while raw.count < size + 2 {
             if !fillMore() { return out }
         }
@@ -352,35 +403,76 @@ private func readAndDecodeChunkedBody(fd: Int32, initial: Data) -> Data {
     }
     return out
 }
-
 // MARK: - Streaming Upstream Bridge (Supports SSE / Chunked LLM Streams)
 
-private final class StreamingUpstreamBridge: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private let clientFD: Int32
-    private let scrubPairs: [(real: String, phantom: String)]
-    private let doneSemaphore = DispatchSemaphore(value: 0)
-    private var sentHeaders = false
-    private var useChunked = true
-    private var writeFailed = false
+/// Process-wide pooled URLSession so upstream LLM API requests reuse HTTP/2+HTTP/3 connections
+/// and TLS 1.3 sessions instead of paying a cold TCP+TLS handshake on every turn.
+private final class UpstreamSessionPool: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private final class TaskState: @unchecked Sendable {
+        let clientFD: Int32
+        let scrubPairs: [(real: String, phantom: String)]
+        let keepAlive: Bool
+        let doneSemaphore = DispatchSemaphore(value: 0)
+        var sentHeaders = false
+        var writeFailed = false
+        var canReuseClient = false
 
-    init(clientFD: Int32, scrubPairs: [(real: String, phantom: String)]) {
-        self.clientFD = clientFD
-        self.scrubPairs = scrubPairs
+        init(clientFD: Int32, scrubPairs: [(real: String, phantom: String)], keepAlive: Bool) {
+            self.clientFD = clientFD
+            self.scrubPairs = scrubPairs
+            self.keepAlive = keepAlive
+        }
     }
 
-    func execute(_ request: URLRequest) {
+    static let shared = UpstreamSessionPool()
+
+    private let lock = NSLock()
+    private var tasks: [Int: TaskState] = [:]
+    private var session: URLSession!
+
+    private override init() {
+        super.init()
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:] // Never recurse through system HTTP_PROXY
         cfg.httpShouldSetCookies = false
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.httpMaximumConnectionsPerHost = 16
         cfg.timeoutIntervalForRequest = 300
         cfg.timeoutIntervalForResource = 1800
+        let queue = OperationQueue()
+        queue.name = "dev.boo-box.proxy-upstream"
+        queue.qualityOfService = .userInitiated
+        self.session = URLSession(configuration: cfg, delegate: self, delegateQueue: queue)
+    }
 
-        let session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+    /// Executes `request` on the shared pooled session, streaming chunked response bytes back to `clientFD`.
+    /// Returns `true` if `clientFD` remains cleanly framed for HTTP/1.1 keep-alive reuse.
+    func execute(
+        _ request: URLRequest,
+        clientFD: Int32,
+        scrubPairs: [(real: String, phantom: String)],
+        keepAlive: Bool
+    ) -> Bool {
+        let state = TaskState(clientFD: clientFD, scrubPairs: scrubPairs, keepAlive: keepAlive)
         let task = session.dataTask(with: request)
+        lock.lock()
+        tasks[task.taskIdentifier] = state
+        lock.unlock()
         task.resume()
-        doneSemaphore.wait()
-        session.invalidateAndCancel()
+        state.doneSemaphore.wait()
+        return state.canReuseClient
+    }
+
+    private func state(for taskID: Int) -> TaskState? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tasks[taskID]
+    }
+
+    private func removeState(for taskID: Int) -> TaskState? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tasks.removeValue(forKey: taskID)
     }
 
     func urlSession(
@@ -389,7 +481,8 @@ private final class StreamingUpstreamBridge: NSObject, URLSessionDataDelegate, @
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        guard let http = response as? HTTPURLResponse else {
+        guard let st = state(for: dataTask.taskIdentifier),
+              let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
             return
         }
@@ -403,19 +496,18 @@ private final class StreamingUpstreamBridge: NSObject, URLSessionDataDelegate, @
             let name = "\(k)"
             if hopByHop.contains(name.lowercased()) { continue }
             var val = "\(v)"
-            for pair in scrubPairs where !pair.real.isEmpty {
+            for pair in st.scrubPairs where !pair.real.isEmpty {
                 if val.contains(pair.real) {
                     val = val.replacingOccurrences(of: pair.real, with: pair.phantom)
                 }
             }
             head += "\(name): \(val)\r\n"
         }
-        // Always stream chunked back to client so SSE works with zero buffering and clean Content-Encoding decode
-        useChunked = true
-        head += "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-        sentHeaders = true
-        if !writeAll(fd: clientFD, data: Data(head.utf8)) {
-            writeFailed = true
+        let connHeader = st.keepAlive ? "keep-alive" : "close"
+        head += "Transfer-Encoding: chunked\r\nConnection: \(connHeader)\r\n\r\n"
+        st.sentHeaders = true
+        if !writeAll(fd: st.clientFD, data: Data(head.utf8)) {
+            st.writeFailed = true
             completionHandler(.cancel)
             return
         }
@@ -423,11 +515,11 @@ private final class StreamingUpstreamBridge: NSObject, URLSessionDataDelegate, @
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard !writeFailed, !data.isEmpty else { return }
+        guard let st = state(for: dataTask.taskIdentifier), !st.writeFailed, !data.isEmpty else { return }
         var payload = data
-        if !scrubPairs.isEmpty, var text = String(data: data, encoding: .utf8) {
+        if !st.scrubPairs.isEmpty, var text = String(data: data, encoding: .utf8) {
             var changed = false
-            for pair in scrubPairs where !pair.real.isEmpty {
+            for pair in st.scrubPairs where !pair.real.isEmpty {
                 if text.contains(pair.real) {
                     text = text.replacingOccurrences(of: pair.real, with: pair.phantom)
                     changed = true
@@ -438,29 +530,35 @@ private final class StreamingUpstreamBridge: NSObject, URLSessionDataDelegate, @
             }
         }
         let prefix = String(format: "%x\r\n", payload.count)
-        var frame = Data(prefix.utf8)
+        var frame = Data(capacity: prefix.utf8.count + payload.count + 2)
+        frame.append(contentsOf: prefix.utf8)
         frame.append(payload)
         frame.append(contentsOf: [0x0D, 0x0A])
-        if !writeAll(fd: clientFD, data: frame) {
-            writeFailed = true
+        if !writeAll(fd: st.clientFD, data: frame) {
+            st.writeFailed = true
             dataTask.cancel()
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if !sentHeaders {
+        guard let st = removeState(for: task.taskIdentifier) else { return }
+        if !st.sentHeaders {
             let msg = error?.localizedDescription ?? "Upstream connection failed"
-            sendHTTPError(fd: clientFD, status: 502, title: "Bad Gateway", reasonHeader: "upstream-error", body: "boo_box proxy: \(msg)\n")
-        } else if useChunked && !writeFailed {
-            _ = writeAll(fd: clientFD, data: Data("0\r\n\r\n".utf8))
+            sendHTTPError(fd: st.clientFD, status: 502, title: "Bad Gateway", reasonHeader: "upstream-error", body: "boo_box proxy: \(msg)\n")
+            st.canReuseClient = false
+        } else if !st.writeFailed {
+            let ok = writeAll(fd: st.clientFD, data: Data("0\r\n\r\n".utf8))
+            st.canReuseClient = ok && st.keepAlive && (error == nil)
+        } else {
+            st.canReuseClient = false
         }
-        doneSemaphore.signal()
+        st.doneSemaphore.signal()
     }
 }
 
-// MARK: - TCP Tunnel for HTTPS CONNECT
+// MARK: - TCP Tunnel for HTTPS CONNECT (Non-Blocking Timeout + Single-Thread poll(2) Relay)
 
-private func openUpstreamTCP(host: String, port: Int) -> Int32 {
+private func openUpstreamTCP(host: String, port: Int, timeoutMs: Int32 = 5_000) -> Int32 {
     var hints = addrinfo()
     hints.ai_socktype = SOCK_STREAM
     hints.ai_family = AF_UNSPEC
@@ -473,8 +571,22 @@ private func openUpstreamTCP(host: String, port: Int) -> Int32 {
     while let info = cur {
         let fd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
         if fd >= 0 {
-            if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 {
+            setSocketNoDelay(fd)
+            setSocketNonBlocking(fd, enabled: true)
+            let c = Darwin.connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen)
+            if c == 0 {
                 return fd
+            }
+            if errno == EINPROGRESS {
+                var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                let prc = Darwin.poll(&pfd, 1, timeoutMs)
+                if prc > 0 {
+                    var soErr: Int32 = 0
+                    var len = socklen_t(MemoryLayout<Int32>.size)
+                    if getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &len) == 0 && soErr == 0 {
+                        return fd
+                    }
+                }
             }
             close(fd)
         }
@@ -483,52 +595,172 @@ private func openUpstreamTCP(host: String, port: Int) -> Int32 {
     return -1
 }
 
-private func relayBidirectional(clientFD: Int32, upstreamFD: Int32) {
-    let group = DispatchGroup()
-    let relayQueue = DispatchQueue.global(qos: .userInitiated)
+/// Single-thread bidirectional `poll(2)` relay for HTTPS CONNECT tunnels.
+/// Avoids spawning 2 extra GCD threads per open socket, eliminating thread-pool starvation under heavy load.
+private func relayBidirectional(clientFD: Int32, upstreamFD: Int32, initialClientBytes: Data = Data()) {
+    setSocketNoDelay(clientFD)
+    setSocketNoDelay(upstreamFD)
+    setSocketNonBlocking(clientFD, enabled: true)
+    setSocketNonBlocking(upstreamFD, enabled: true)
 
-    @Sendable func pump(from src: Int32, to dst: Int32) {
-        var buf = [UInt8](repeating: 0, count: 32768)
-        while true {
-            let n = Darwin.read(src, &buf, buf.count)
-            if n < 0 {
-                if errno == EINTR { continue }
-                break
-            }
-            if n == 0 { break }
-            var off = 0
-            while off < n {
-                let w = Darwin.write(dst, &buf[off], n - off)
-                if w < 0 {
+    let maxBuf = 65536
+    var c2u = [UInt8](initialClientBytes)
+    var c2uOff = 0
+    var u2c: [UInt8] = []
+    var u2cOff = 0
+    var scratch = [UInt8](repeating: 0, count: 32768)
+
+    var clientEOF = false
+    var upstreamEOF = false
+    var sentUpEOF = false
+    var sentClientEOF = false
+
+    while true {
+        if c2uOff == c2u.count { c2u.removeAll(keepingCapacity: true); c2uOff = 0 }
+        if u2cOff == u2c.count { u2c.removeAll(keepingCapacity: true); u2cOff = 0 }
+
+        if clientEOF && c2u.isEmpty && !sentUpEOF {
+            shutdown(upstreamFD, SHUT_WR)
+            sentUpEOF = true
+        }
+        if upstreamEOF && u2c.isEmpty && !sentClientEOF {
+            shutdown(clientFD, SHUT_WR)
+            sentClientEOF = true
+        }
+        if sentUpEOF && sentClientEOF { break }
+
+        var cEvents: Int16 = 0
+        if !clientEOF && (c2u.count - c2uOff) < maxBuf { cEvents |= Int16(POLLIN) }
+        if !u2c.isEmpty && !sentClientEOF { cEvents |= Int16(POLLOUT) }
+
+        var uEvents: Int16 = 0
+        if !upstreamEOF && (u2c.count - u2cOff) < maxBuf { uEvents |= Int16(POLLIN) }
+        if !c2u.isEmpty && !sentUpEOF { uEvents |= Int16(POLLOUT) }
+
+        if cEvents == 0 && uEvents == 0 { break }
+
+        var pfds = [
+            pollfd(fd: clientFD, events: cEvents, revents: 0),
+            pollfd(fd: upstreamFD, events: uEvents, revents: 0),
+        ]
+        let rc = Darwin.poll(&pfds, 2, 60_000)
+        if rc < 0 {
+            if errno == EINTR { continue }
+            break
+        }
+        if rc == 0 { continue }
+
+        // 1. Read client -> c2u
+        if (pfds[0].revents & Int16(POLLIN | POLLHUP)) != 0 && !clientEOF {
+            while (c2u.count - c2uOff) < maxBuf {
+                let n = Darwin.read(clientFD, &scratch, min(scratch.count, maxBuf - (c2u.count - c2uOff)))
+                if n > 0 {
+                    c2u.append(contentsOf: scratch[0..<n])
+                } else if n == 0 {
+                    clientEOF = true
+                    break
+                } else {
                     if errno == EINTR { continue }
-                    return
+                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                    clientEOF = true
+                    break
                 }
-                if w == 0 { return }
-                off += w
             }
         }
-        shutdown(dst, SHUT_WR)
-    }
+        if (pfds[0].revents & Int16(POLLERR | POLLNVAL)) != 0 {
+            clientEOF = true
+            u2c.removeAll(keepingCapacity: false)
+            u2cOff = 0
+            sentClientEOF = true
+        }
 
-    group.enter()
-    relayQueue.async {
-        pump(from: clientFD, to: upstreamFD)
-        group.leave()
+        // 2. Read upstream -> u2c
+        if (pfds[1].revents & Int16(POLLIN | POLLHUP)) != 0 && !upstreamEOF {
+            while (u2c.count - u2cOff) < maxBuf {
+                let n = Darwin.read(upstreamFD, &scratch, min(scratch.count, maxBuf - (u2c.count - u2cOff)))
+                if n > 0 {
+                    u2c.append(contentsOf: scratch[0..<n])
+                } else if n == 0 {
+                    upstreamEOF = true
+                    break
+                } else {
+                    if errno == EINTR { continue }
+                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                    upstreamEOF = true
+                    break
+                }
+            }
+        }
+        if (pfds[1].revents & Int16(POLLERR | POLLNVAL)) != 0 {
+            upstreamEOF = true
+            c2u.removeAll(keepingCapacity: false)
+            c2uOff = 0
+            sentUpEOF = true
+        }
+
+        // 3. Flush c2u -> upstream
+        while c2uOff < c2u.count {
+            let w = c2u.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return Darwin.write(upstreamFD, base.advanced(by: c2uOff), c2u.count - c2uOff)
+            }
+            if w > 0 {
+                c2uOff += w
+            } else if w < 0 {
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                c2u.removeAll(keepingCapacity: false)
+                c2uOff = 0
+                sentUpEOF = true
+                clientEOF = true
+                break
+            } else {
+                break
+            }
+        }
+
+        // 4. Flush u2c -> client
+        while u2cOff < u2c.count {
+            let w = u2c.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return Darwin.write(clientFD, base.advanced(by: u2cOff), u2c.count - u2cOff)
+            }
+            if w > 0 {
+                u2cOff += w
+            } else if w < 0 {
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                u2c.removeAll(keepingCapacity: false)
+                u2cOff = 0
+                sentClientEOF = true
+                upstreamEOF = true
+                break
+            } else {
+                break
+            }
+        }
     }
-    group.enter()
-    relayQueue.async {
-        pump(from: upstreamFD, to: clientFD)
-        group.leave()
-    }
-    group.wait()
 }
 
-// MARK: - Core Request Handler
+// MARK: - Core Request Handler (Supports HTTP/1.1 Keep-Alive on Client Loopback Socket)
 
 private func handleProxyClient(clientFD: Int32, state: ProxyState) {
     defer { close(clientFD) }
-    guard let req = readHTTPRequest(fd: clientFD) else { return }
+    setSocketNoDelay(clientFD)
+    var leftover = Data()
 
+    while let req = readHTTPRequest(fd: clientFD, leftover: &leftover, idleTimeoutMs: 30_000) {
+        let shouldContinue = handleSingleProxyRequest(req: req, clientFD: clientFD, state: state, leftover: &leftover)
+        if !shouldContinue { break }
+    }
+}
+
+private func handleSingleProxyRequest(
+    req: (method: String, target: String, version: String, headers: [(String, String)], body: Data),
+    clientFD: Int32,
+    state: ProxyState,
+    leftover: inout Data
+) -> Bool {
     let proxyAuth = req.headers.first { $0.0.lowercased() == "proxy-authorization" }?.1
     var sessionId = state.resolveSession(fromProxyAuthHeader: proxyAuth)
 
@@ -555,29 +787,30 @@ private func handleProxyClient(clientFD: Int32, state: ProxyState) {
         if isBlockedMetadataHost(normHost) {
             state.record(sessionId: sessionId, method: "CONNECT", host: normHost, decision: "blocked", reason: "Cloud metadata IP blocked")
             sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "metadata-blocked", body: "boo_box proxy: metadata endpoint blocked\n")
-            return
+            return false
         }
         if snap.egressMode == "offline" {
             state.record(sessionId: sessionId, method: "CONNECT", host: normHost, decision: "blocked", reason: "Offline mode")
             sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "offline", body: "boo_box proxy: sandbox network is Offline\n")
-            return
+            return false
         }
         if snap.egressMode == "allowlist" && !hostMatches(normHost, patterns: snap.allowedDomains) {
             state.record(sessionId: sessionId, method: "CONNECT", host: normHost, decision: "blocked", reason: "Host not in Dev Allowlist")
             sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "domain-blocked", body: "boo_box proxy: host '\(normHost)' is not in Dev Allowlist\n")
-            return
+            return false
         }
 
         let upFD = openUpstreamTCP(host: host, port: port)
         guard upFD >= 0 else {
             sendHTTPError(fd: clientFD, status: 502, title: "Bad Gateway", reasonHeader: "connect-failed", body: "boo_box proxy: failed to connect to \(host):\(port)\n")
-            return
+            return false
         }
         defer { close(upFD) }
         state.record(sessionId: sessionId, method: "CONNECT", host: normHost, decision: "allowed", reason: snap.egressMode)
-        guard writeAll(fd: clientFD, data: Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)) else { return }
-        relayBidirectional(clientFD: clientFD, upstreamFD: upFD)
-        return
+        guard writeAll(fd: clientFD, data: Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)) else { return false }
+        relayBidirectional(clientFD: clientFD, upstreamFD: upFD, initialClientBytes: leftover)
+        leftover.removeAll(keepingCapacity: false)
+        return false
     }
 
     // 2. Determine target upstream URL (either Base-URL reverse proxy or forward plaintext HTTP)
@@ -592,14 +825,14 @@ private func handleProxyClient(clientFD: Int32, state: ProxyState) {
         let parts = rest.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
         guard let hostSeg = parts.first, !hostSeg.isEmpty else {
             sendHTTPError(fd: clientFD, status: 400, title: "Bad Request", reasonHeader: "bad-upstream", body: "boo_box proxy: missing upstream host\n")
-            return
+            return false
         }
         targetHostPort = String(hostSeg)
         let norm = normalizeHost(targetHostPort)
         // `/upstream-http/` is permitted ONLY for loopback test endpoints; all remote hosts use HTTPS
         if isLocalHTTP && norm != "127.0.0.1" && norm != "localhost" {
             sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "https-required", body: "boo_box proxy: /upstream-http/ is restricted to localhost\n")
-            return
+            return false
         }
         upstreamScheme = isLocalHTTP ? "http" : "https"
         targetPath = parts.count > 1 ? "/" + String(parts[1]) : "/"
@@ -618,14 +851,14 @@ private func handleProxyClient(clientFD: Int32, state: ProxyState) {
         targetPath = p
     } else {
         sendHTTPError(fd: clientFD, status: 400, title: "Bad Request", reasonHeader: "unsupported-target", body: "boo_box proxy: expected absolute URL or /upstream/<host>/...\n")
-        return
+        return false
     }
     let normHost = normalizeHost(targetHostPort)
 
     if isBlockedMetadataHost(normHost) {
         state.record(sessionId: sessionId, method: req.method, host: normHost, decision: "blocked", reason: "Cloud metadata IP blocked")
         sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "metadata-blocked", body: "boo_box proxy: metadata endpoint blocked\n")
-        return
+        return false
     }
 
     // 3. Active phantom-token leak detection + host-bound secret substitution
@@ -662,7 +895,7 @@ private func handleProxyClient(clientFD: Int32, state: ProxyState) {
                     reasonHeader: "secret-exfiltration-blocked",
                     body: "boo_box proxy: BLOCKED \(reason)\n"
                 )
-                return
+                return false
             }
             if inPath {
                 mutatedPath = mutatedPath.replacingOccurrences(of: tok, with: secret.realValue)
@@ -684,17 +917,17 @@ private func handleProxyClient(clientFD: Int32, state: ProxyState) {
     if snap.egressMode == "offline" {
         state.record(sessionId: sessionId, method: req.method, host: normHost, decision: "blocked", reason: "Offline mode")
         sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "offline", body: "boo_box proxy: sandbox network is Offline\n")
-        return
+        return false
     }
     if snap.egressMode == "allowlist" && !hostMatches(normHost, patterns: snap.allowedDomains) {
         state.record(sessionId: sessionId, method: req.method, host: normHost, decision: "blocked", reason: "Host not in Dev Allowlist")
         sendHTTPError(fd: clientFD, status: 403, title: "Forbidden", reasonHeader: "domain-blocked", body: "boo_box proxy: host '\(normHost)' is not in Dev Allowlist\n")
-        return
+        return false
     }
 
     guard let upstreamURL = URL(string: "\(upstreamScheme)://\(targetHostPort)\(mutatedPath)") else {
         sendHTTPError(fd: clientFD, status: 400, title: "Bad Request", reasonHeader: "invalid-url", body: "boo_box proxy: invalid upstream URL\n")
-        return
+        return false
     }
 
     var urlReq = URLRequest(url: upstreamURL)
@@ -723,8 +956,23 @@ private func handleProxyClient(clientFD: Int32, state: ProxyState) {
         state.record(sessionId: sessionId, method: req.method, host: normHost, decision: "allowed", reason: snap.egressMode)
     }
 
-    let bridge = StreamingUpstreamBridge(clientFD: clientFD, scrubPairs: scrubPairs)
-    bridge.execute(urlReq)
+    let connVal = req.headers.first {
+        let k = $0.0.lowercased()
+        return k == "connection" || k == "proxy-connection"
+    }?.1.lowercased() ?? ""
+    let wantsKeepAlive: Bool
+    if req.version == "HTTP/1.0" {
+        wantsKeepAlive = connVal.contains("keep-alive")
+    } else {
+        wantsKeepAlive = !connVal.contains("close")
+    }
+
+    return UpstreamSessionPool.shared.execute(
+        urlReq,
+        clientFD: clientFD,
+        scrubPairs: scrubPairs,
+        keepAlive: wantsKeepAlive
+    )
 }
 
 // MARK: - Host Control Unix Socket (`0600`)
