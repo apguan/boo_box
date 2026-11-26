@@ -19,12 +19,14 @@ final class DaemonClient: @unchecked Sendable {
     static let shared = DaemonClient()
 
     let controlSocketPath: String
+    private let pidFilePath: String
     private let startLock = NSLock()
 
     private init() {
         let runDir = BooBoxPaths.rootDirURL.appendingPathComponent("run", isDirectory: true)
         try? FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
         self.controlSocketPath = runDir.appendingPathComponent("booboxd.sock").path
+        self.pidFilePath = runDir.appendingPathComponent("booboxd.pid").path
     }
 
     func resolveDaemonBinaryURL() -> URL? {
@@ -53,9 +55,9 @@ final class DaemonClient: @unchecked Sendable {
         return nil
     }
 
-    /// Returns `true` if `booboxd` is already running and responsive on `booboxd.sock`.
+    /// Returns `true` if `booboxd` is already running and responsive on `booboxd.sock` (fast 350ms timeout).
     func ping() -> (alive: Bool, livePanes: Int) {
-        guard let resp = sendCommand(["op": "ping"]),
+        guard let resp = sendCommand(["op": "ping"], timeoutMs: 350),
               let obj = try? JSONSerialization.jsonObject(with: resp) as? [String: Any],
               (obj["ok"] as? Bool) == true else {
             return (false, 0)
@@ -63,7 +65,7 @@ final class DaemonClient: @unchecked Sendable {
         return (true, obj["livePanes"] as? Int ?? 0)
     }
 
-    /// Ensures `booboxd` is running as a detached background daemon.
+    /// Ensures `booboxd` is running as a detached background daemon (self-heals stale/wedged sockets in <500ms).
     @discardableResult
     func ensureRunning() -> Bool {
         if ping().alive { return true }
@@ -71,6 +73,17 @@ final class DaemonClient: @unchecked Sendable {
         startLock.lock()
         defer { startLock.unlock() }
         if ping().alive { return true }
+
+        // Self-heal: if a stale/wedged booboxd left booboxd.sock unresponsive, reap its PID and unlink the socket
+        if FileManager.default.fileExists(atPath: controlSocketPath) {
+            if let pidStr = try? String(contentsOfFile: pidFilePath, encoding: .utf8),
+               let stalePID = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+               stalePID > 1 {
+                _ = Darwin.kill(stalePID, SIGTERM)
+                _ = Darwin.kill(stalePID, SIGKILL)
+            }
+            unlink(controlSocketPath)
+        }
 
         guard let bin = resolveDaemonBinaryURL() else { return false }
         let proc = Process()
@@ -84,11 +97,11 @@ final class DaemonClient: @unchecked Sendable {
             return false
         }
 
-        // Wait up to 2s for booboxd.sock to become ready
-        let deadline = Date().addingTimeInterval(2.0)
+        // Wait up to 1.2s for fresh booboxd.sock to become ready
+        let deadline = Date().addingTimeInterval(1.2)
         while Date() < deadline {
             if ping().alive { return true }
-            usleep(25_000)
+            usleep(15_000)
         }
         return false
     }
@@ -113,7 +126,7 @@ final class DaemonClient: @unchecked Sendable {
 
     /// Lists all live panes currently hosted by `booboxd` (including foreground busy status).
     func listPanes() -> [DaemonPaneStatus] {
-        guard let resp = sendCommand(["op": "list"]) else { return [] }
+        guard let resp = sendCommand(["op": "list"], timeoutMs: 500) else { return [] }
         struct ListResp: Decodable {
             let ok: Bool
             let panes: [DaemonPaneStatus]
@@ -141,16 +154,17 @@ final class DaemonClient: @unchecked Sendable {
         return "\(q(attach.path)) \(q(socketPath)) \(q(cwd))"
     }
 
-    private func sendCommand(_ payload: [String: Any]) -> Data? {
+    private func sendCommand(_ payload: [String: Any], timeoutMs: Int = 1500) -> Data? {
         guard let json = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
 
-        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        let sec = timeoutMs / 1000
+        let usec = Int32((timeoutMs % 1000) * 1000)
+        var tv = timeval(tv_sec: sec, tv_usec: usec)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let maxLen = MemoryLayout.size(ofValue: addr.sun_path)

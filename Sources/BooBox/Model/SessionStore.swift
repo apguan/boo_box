@@ -422,6 +422,7 @@ final class SessionStore: ObservableObject {
     @Published var searchQuery: String = ""
     @Published var searchFocusRequestID: Int = 0
     @Published var cloningProjectName: String?
+    private var pendingProjectOpenID: UUID?
     @Published var pinnedFolderPaths: [String] = []
     private let pinnedFoldersURL: URL = {
         BooBoxPaths.rootDirURL.appendingPathComponent("pinned-folders.json")
@@ -710,58 +711,88 @@ final class SessionStore: ObservableObject {
         let projectName = cleanName.isEmpty ? templateDirURL.lastPathComponent : cleanName
         let autoNameEnabled = BooBoxConfigManager.shared.config.general.autoNameSessions
         let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
         let preclonedWS = MacOSSandboxManager.shared.sessionsRootURL
             .appendingPathComponent("s-\(String(id.uuidString.prefix(8)).lowercased())/workspace", isDirectory: true)
-        let initialName: String
-        if autoNameEnabled {
-            initialName = MacOSSandboxManager.shared.semanticProjectName(
-                projectName: projectName,
-                sourceDir: preclonedWS,
-                avoiding: existingNames
-            )
-        } else {
-            initialName = MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
-        }
 
-        do {
-            let sandbox = try MacOSSandboxManager.shared.adoptPreclonedSession(
-                id: id,
-                name: initialName,
-                sourceProjectPath: templateDirURL.path
-            )
-            _ = startSessionWithMacSandbox(sandbox, sequenceNumber: seq)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let initialName: String = autoNameEnabled
+                ? MacOSSandboxManager.shared.semanticProjectName(
+                    projectName: projectName,
+                    sourceDir: preclonedWS,
+                    avoiding: existingNames
+                )
+                : MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
 
-            // Snapshot untouched copy into ~/boo_box/templates/ in background for future ⌘T tabs
-            let cfg = BooBoxConfigManager.shared.config.general
-            MacOSSandboxManager.shared.snapshotTemplateInBackground(
-                from: sandbox.workspaceDir,
-                to: templateDirURL,
-                excludeEnvFiles: excludeEnvOverride ?? cfg.excludeEnvFilesWhenCloning,
-                skipHeavyDirs: cfg.skipHeavyDirsWhenCloning
-            )
-        } catch {
-            presentProjectError(error)
+            let result: Result<(MacSandboxSession, PreparedSandboxLaunch), Error> = Result {
+                let sandbox = try MacOSSandboxManager.shared.adoptPreclonedSession(
+                    id: id,
+                    name: initialName,
+                    sourceProjectPath: templateDirURL.path
+                )
+                let prepared = Self.prepareSandboxLaunch(
+                    for: sandbox,
+                    cwd: sandbox.workspaceDir.path,
+                    context: GHOSTTY_SURFACE_CONTEXT_TAB,
+                    useDaemon: useDaemon
+                )
+                return (sandbox, prepared)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch result {
+                case .success(let (sandbox, prepared)):
+                    _ = self.attachPreparedMacSandboxSession(sandbox, prepared: prepared, sequenceNumber: seq)
+                    let cfg = BooBoxConfigManager.shared.config.general
+                    MacOSSandboxManager.shared.snapshotTemplateInBackground(
+                        from: sandbox.workspaceDir,
+                        to: templateDirURL,
+                        excludeEnvFiles: excludeEnvOverride ?? cfg.excludeEnvFilesWhenCloning,
+                        skipHeavyDirs: cfg.skipHeavyDirsWhenCloning
+                    )
+                case .failure(let error):
+                    self.presentProjectError(error)
+                }
+            }
         }
     }
+
     private func createScratchMacSandboxSession(sequenceNumber seq: Int) -> TerminalSession? {
         let sessionID = UUID()
         let autoNameEnabled = BooBoxConfigManager.shared.config.general.autoNameSessions
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
         let existing = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
         let initialName: String = autoNameEnabled
             ? MacOSSandboxManager.shared.semanticScratchName(avoiding: existing)
             : "Session \(seq)"
-        let sandbox: MacSandboxSession
-        do {
-            sandbox = try MacOSSandboxManager.shared.createSession(
-                id: sessionID,
-                name: initialName,
-                hasUserCustomName: false
-            )
-        } catch {
-            presentVMError(error)
-            return nil
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<(MacSandboxSession, PreparedSandboxLaunch), Error> = Result {
+                let sandbox = try MacOSSandboxManager.shared.createSession(
+                    id: sessionID,
+                    name: initialName,
+                    hasUserCustomName: false
+                )
+                let prepared = Self.prepareSandboxLaunch(
+                    for: sandbox,
+                    cwd: sandbox.workspaceDir.path,
+                    context: GHOSTTY_SURFACE_CONTEXT_TAB,
+                    useDaemon: useDaemon
+                )
+                return (sandbox, prepared)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch result {
+                case .success(let (sandbox, prepared)):
+                    _ = self.attachPreparedMacSandboxSession(sandbox, prepared: prepared, sequenceNumber: seq)
+                case .failure(let error):
+                    self.presentVMError(error)
+                }
+            }
         }
-        return startSessionWithMacSandbox(sandbox, sequenceNumber: seq)
+        return nil
     }
 
     private func spawnClonedProjectSession(
@@ -774,21 +805,26 @@ final class SessionStore: ObservableObject {
         let seq = nextAvailableSequenceNumber(for: .sandbox)
         let projectName = displayName
         let autoNameEnabled = BooBoxConfigManager.shared.config.general.autoNameSessions
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
         let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
-        let initialName: String
-        if autoNameEnabled {
-            initialName = MacOSSandboxManager.shared.semanticProjectName(
-                projectName: projectName,
-                sourceDir: projectURL,
-                avoiding: existingNames
-            )
-        } else {
-            initialName = MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
+
+        // Debounce progress banner by 250ms so ~20 ms CoW overlay mounts never flash a "Cloning..." spinner
+        pendingProjectOpenID = sessionID
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.pendingProjectOpenID == sessionID else { return }
+            self.cloningProjectName = projectName
         }
-        cloningProjectName = projectName
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result: Result<MacSandboxSession, Error> = Result {
-                try MacOSSandboxManager.shared.createSession(
+            let initialName: String = autoNameEnabled
+                ? MacOSSandboxManager.shared.semanticProjectName(
+                    projectName: projectName,
+                    sourceDir: projectURL,
+                    avoiding: existingNames
+                )
+                : MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
+
+            let result: Result<(MacSandboxSession, PreparedSandboxLaunch), Error> = Result {
+                let sandbox = try MacOSSandboxManager.shared.createSession(
                     id: sessionID,
                     name: initialName,
                     hasUserCustomName: false,
@@ -796,13 +832,24 @@ final class SessionStore: ObservableObject {
                     excludeEnvFilesOverride: excludeEnvOverride,
                     workspaceModeOverride: forceOverlay ? .overlay : nil
                 )
+                let prepared = Self.prepareSandboxLaunch(
+                    for: sandbox,
+                    cwd: sandbox.workspaceDir.path,
+                    context: GHOSTTY_SURFACE_CONTEXT_TAB,
+                    useDaemon: useDaemon
+                )
+                return (sandbox, prepared)
             }
+
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                if self.pendingProjectOpenID == sessionID {
+                    self.pendingProjectOpenID = nil
+                }
                 self.cloningProjectName = nil
                 switch result {
-                case .success(let sandbox):
-                    _ = self.startSessionWithMacSandbox(sandbox, sequenceNumber: seq)
+                case .success(let (sandbox, prepared)):
+                    _ = self.attachPreparedMacSandboxSession(sandbox, prepared: prepared, sequenceNumber: seq)
                     if !sandbox.isOverlay {
                         let cfg = BooBoxConfigManager.shared.config.general
                         MacOSSandboxManager.shared.replenishWarmCloneInBackground(
@@ -819,6 +866,7 @@ final class SessionStore: ObservableObject {
             }
         }
     }
+
     private func presentProjectError(_ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -832,28 +880,50 @@ final class SessionStore: ObservableObject {
     @discardableResult
     func resumeSavedMacSession(_ sandbox: MacSandboxSession) -> TerminalSession? {
         savedMacSessions.removeAll { $0.id == sandbox.id }
-        let refreshed: MacSandboxSession
-        do {
-            refreshed = try MacOSSandboxManager.shared.prepareForResume(sandbox)
-        } catch {
-            presentVMError(error)
-            return nil
-        }
         let seq = nextAvailableSequenceNumber(for: .sandbox)
-        return startSessionWithMacSandbox(refreshed, sequenceNumber: seq)
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<(MacSandboxSession, PreparedSandboxLaunch), Error> = Result {
+                let refreshed = try MacOSSandboxManager.shared.prepareForResume(sandbox)
+                let prepared = Self.prepareSandboxLaunch(
+                    for: refreshed,
+                    cwd: refreshed.workspaceDir.path,
+                    context: GHOSTTY_SURFACE_CONTEXT_TAB,
+                    useDaemon: useDaemon
+                )
+                return (refreshed, prepared)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch result {
+                case .success(let (refreshed, prepared)):
+                    _ = self.attachPreparedMacSandboxSession(refreshed, prepared: prepared, sequenceNumber: seq)
+                case .failure(let error):
+                    self.refreshSavedMacSessions()
+                    self.presentVMError(error)
+                }
+            }
+        }
+        return nil
     }
 
-    private func makeSandboxPane(
+    private struct PreparedSandboxLaunch: @unchecked Sendable {
+        let options: SurfaceLaunchOptions
+        let daemonPaneID: String?
+    }
+
+    /// Prepares daemon PTY pane + proxy policy off the main thread so opening/splitting/resuming never blocks UI.
+    private nonisolated static func prepareSandboxLaunch(
         for sandbox: MacSandboxSession,
         cwd: String,
         context: ghostty_surface_context_e,
+        useDaemon: Bool,
         reattachPane: DaemonPaneStatus? = nil
-    ) -> TerminalPane {
-        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+    ) -> PreparedSandboxLaunch {
         if useDaemon {
             if let existing = reattachPane, existing.alive,
                let attachCmd = DaemonClient.shared.buildAttachCommand(socketPath: existing.socketPath, cwd: cwd) {
-                // Ensure proxy policy is synced for this reattached session
                 _ = SecretsVaultManager.shared.sandboxEnvironment(for: sandbox.shortID, overrides: sandbox.overrides)
                 let opts = SurfaceLaunchOptions(
                     workingDirectory: NSHomeDirectory(),
@@ -861,7 +931,7 @@ final class SessionStore: ObservableObject {
                     environmentVariables: ["BOOBOX_MODE": "mac_sandbox"],
                     context: context
                 )
-                return TerminalPane(launchOptions: opts, daemonPaneID: existing.paneId)
+                return PreparedSandboxLaunch(options: opts, daemonPaneID: existing.paneId)
             }
             let paneID = UUID().uuidString
             let cmd = MacOSSandboxManager.shared.launchCommand(for: sandbox)
@@ -873,7 +943,7 @@ final class SessionStore: ObservableObject {
                     environmentVariables: ["BOOBOX_MODE": "mac_sandbox"],
                     context: context
                 )
-                return TerminalPane(launchOptions: opts, daemonPaneID: paneID)
+                return PreparedSandboxLaunch(options: opts, daemonPaneID: paneID)
             }
         }
 
@@ -883,21 +953,33 @@ final class SessionStore: ObservableObject {
             environmentVariables: MacOSSandboxManager.shared.launchEnvironment(for: sandbox),
             context: context
         )
-        return TerminalPane(launchOptions: opts)
+        return PreparedSandboxLaunch(options: opts, daemonPaneID: nil)
     }
 
-    private func startSessionWithMacSandbox(
-        _ sandbox: MacSandboxSession,
-        sequenceNumber: Int,
-        reattachPane: DaemonPaneStatus? = nil,
-        focusImmediately: Bool = true
-    ) -> TerminalSession {
-        let pane = makeSandboxPane(
+    private func makeSandboxPane(
+        for sandbox: MacSandboxSession,
+        cwd: String,
+        context: ghostty_surface_context_e,
+        reattachPane: DaemonPaneStatus? = nil
+    ) -> TerminalPane {
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+        let prepared = Self.prepareSandboxLaunch(
             for: sandbox,
-            cwd: sandbox.workspaceDir.path,
-            context: GHOSTTY_SURFACE_CONTEXT_TAB,
+            cwd: cwd,
+            context: context,
+            useDaemon: useDaemon,
             reattachPane: reattachPane
         )
+        return TerminalPane(launchOptions: prepared.options, daemonPaneID: prepared.daemonPaneID)
+    }
+
+    private func attachPreparedMacSandboxSession(
+        _ sandbox: MacSandboxSession,
+        prepared: PreparedSandboxLaunch,
+        sequenceNumber: Int,
+        focusImmediately: Bool = true
+    ) -> TerminalSession {
+        let pane = TerminalPane(launchOptions: prepared.options, daemonPaneID: prepared.daemonPaneID)
         let session = TerminalSession(id: sandbox.id, mode: .sandbox, sequenceNumber: sequenceNumber, initialPane: pane)
         session.macSandbox = sandbox
         session.overrides = sandbox.overrides
@@ -910,6 +992,28 @@ final class SessionStore: ObservableObject {
         stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: focusImmediately)
         saveOpenSessionsState()
         return session
+    }
+
+    private func startSessionWithMacSandbox(
+        _ sandbox: MacSandboxSession,
+        sequenceNumber: Int,
+        reattachPane: DaemonPaneStatus? = nil,
+        focusImmediately: Bool = true
+    ) -> TerminalSession {
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+        let prepared = Self.prepareSandboxLaunch(
+            for: sandbox,
+            cwd: sandbox.workspaceDir.path,
+            context: GHOSTTY_SURFACE_CONTEXT_TAB,
+            useDaemon: useDaemon,
+            reattachPane: reattachPane
+        )
+        return attachPreparedMacSandboxSession(
+            sandbox,
+            prepared: prepared,
+            sequenceNumber: sequenceNumber,
+            focusImmediately: focusImmediately
+        )
     }
 
     func revealSessionInFinder(_ id: UUID) {
@@ -1028,20 +1132,32 @@ final class SessionStore: ObservableObject {
         let launchDir = (currentPwd != nil && currentPwd!.hasPrefix(sandbox.workspaceDir.path))
             ? currentPwd!
             : sandbox.workspaceDir.path
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
 
         session.destroyAllPanes(killDaemonPanes: true)
-        let freshPane = makeSandboxPane(for: sandbox, cwd: launchDir, context: GHOSTTY_SURFACE_CONTEXT_TAB)
-        attachPaneHandlers(freshPane, in: session)
-        session.observePane(freshPane)
-        session.isDetachedLive = freshPane.daemonPaneID != nil
-        session.pendingProxyAlert = nil
-        session.rootNode = .leaf(freshPane)
-        session.focusedPaneID = freshPane.id
-        session.refreshMirroredState()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak session] in
+            let prepared = Self.prepareSandboxLaunch(
+                for: sandbox,
+                cwd: launchDir,
+                context: GHOSTTY_SURFACE_CONTEXT_TAB,
+                useDaemon: useDaemon
+            )
+            DispatchQueue.main.async { [weak self, weak session] in
+                guard let self, let session, self.sessions.contains(where: { $0.id == session.id }) else { return }
+                let freshPane = TerminalPane(launchOptions: prepared.options, daemonPaneID: prepared.daemonPaneID)
+                self.attachPaneHandlers(freshPane, in: session)
+                session.observePane(freshPane)
+                session.isDetachedLive = freshPane.daemonPaneID != nil
+                session.pendingProxyAlert = nil
+                session.rootNode = .leaf(freshPane)
+                session.focusedPaneID = freshPane.id
+                session.refreshMirroredState()
 
-        stageView.rebuildSession(session)
-        stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
-        saveOpenSessionsState()
+                self.stageView.rebuildSession(session)
+                self.stageView.sync(sessions: self.sessions, selectedSessionID: self.selectedSessionID, focusActive: true)
+                self.saveOpenSessionsState()
+            }
+        }
     }
     func deleteActiveSessionPermanently(_ id: UUID) {
         guard let session = sessions.first(where: { $0.id == id }),
@@ -1310,19 +1426,32 @@ final class SessionStore: ObservableObject {
             if let sb = session.macSandbox {
                 let candidate = currentPane.pwd ?? sb.workspaceDir.path
                 let splitCwd = candidate.hasPrefix(sb.sessionDir.path) ? candidate : sb.workspaceDir.path
-                let newPane = makeSandboxPane(for: sb, cwd: splitCwd, context: GHOSTTY_SURFACE_CONTEXT_SPLIT)
-                attachPaneHandlers(newPane, in: session)
-                session.observePane(newPane)
-                session.rootNode = session.rootNode.splitting(
-                    paneID: currentPane.id,
-                    axis: axis,
-                    newPane: newPane,
-                    insertBefore: insertBefore
-                )
-                session.focusedPaneID = newPane.id
-                session.refreshMirroredState()
-                stageView.rebuildSession(session)
-                stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
+                let targetPaneID = currentPane.id
+                let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+                DispatchQueue.global(qos: .userInitiated).async { [weak self, weak session] in
+                    let prepared = Self.prepareSandboxLaunch(
+                        for: sb,
+                        cwd: splitCwd,
+                        context: GHOSTTY_SURFACE_CONTEXT_SPLIT,
+                        useDaemon: useDaemon
+                    )
+                    DispatchQueue.main.async { [weak self, weak session] in
+                        guard let self, let session, self.sessions.contains(where: { $0.id == session.id }) else { return }
+                        let newPane = TerminalPane(launchOptions: prepared.options, daemonPaneID: prepared.daemonPaneID)
+                        self.attachPaneHandlers(newPane, in: session)
+                        session.observePane(newPane)
+                        session.rootNode = session.rootNode.splitting(
+                            paneID: targetPaneID,
+                            axis: axis,
+                            newPane: newPane,
+                            insertBefore: insertBefore
+                        )
+                        session.focusedPaneID = newPane.id
+                        session.refreshMirroredState()
+                        self.stageView.rebuildSession(session)
+                        self.stageView.sync(sessions: self.sessions, selectedSessionID: self.selectedSessionID, focusActive: true)
+                    }
+                }
                 return
             } else {
                 return

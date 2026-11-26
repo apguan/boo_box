@@ -109,6 +109,10 @@ private func isExistingDaemonAlive(controlSocket: String) -> Bool {
     guard fd >= 0 else { return false }
     defer { close(fd) }
 
+    var tv = timeval(tv_sec: 0, tv_usec: 300_000) // 300ms timeout so hung old daemon never blocks startup
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
@@ -165,12 +169,14 @@ private final class ManagedPane: @unchecked Sendable {
     private let clientWriteLock = NSLock()
     private var masterFD: Int32
     private var listenFD: Int32 = -1
+    private var wakeReadFD: Int32 = -1
+    private var wakeWriteFD: Int32 = -1
+    private var activeLoops: Int = 2
     private var activeClientFD: Int32 = -1
     private var ringBuffer = Data()
     private var alive = true
     private var exitCode: Int32? = nil
     private var stopped = false
-
     var onFinalCleanup: (() -> Void)?
 
     init?(paneId: String, sessionId: String, socketPath: String, cwd: String, command: String) {
@@ -213,10 +219,25 @@ private final class ManagedPane: @unchecked Sendable {
         self.masterFD = mfd
         self.childPID = pid
 
+        var pipeFDs: [Int32] = [-1, -1]
+        guard pipe(&pipeFDs) == 0 else {
+            _ = Darwin.kill(-pid, SIGHUP)
+            close(mfd)
+            return nil
+        }
+        setCloseOnExec(pipeFDs[0])
+        setCloseOnExec(pipeFDs[1])
+        _ = fcntl(pipeFDs[0], F_SETFL, O_NONBLOCK)
+        _ = fcntl(pipeFDs[1], F_SETFL, O_NONBLOCK)
+        self.wakeReadFD = pipeFDs[0]
+        self.wakeWriteFD = pipeFDs[1]
+
         let lfd = createUnixListener(at: socketPath, mode: 0o600)
         guard lfd >= 0 else {
             _ = Darwin.kill(-pid, SIGHUP)
             close(mfd)
+            close(pipeFDs[0])
+            close(pipeFDs[1])
             return nil
         }
         self.listenFD = lfd
@@ -263,6 +284,28 @@ private final class ManagedPane: @unchecked Sendable {
         )
     }
 
+    private func signalWakePipeLocked() {
+        if wakeWriteFD >= 0 {
+            var b: UInt8 = 1
+            _ = Darwin.write(wakeWriteFD, &b, 1)
+        }
+    }
+
+    private func markLoopFinished() {
+        stateLock.lock()
+        activeLoops -= 1
+        let shouldCloseWake = (activeLoops <= 0)
+        let rfd = shouldCloseWake ? wakeReadFD : -1
+        let wfd = shouldCloseWake ? wakeWriteFD : -1
+        if shouldCloseWake {
+            wakeReadFD = -1
+            wakeWriteFD = -1
+        }
+        stateLock.unlock()
+        if rfd >= 0 { close(rfd) }
+        if wfd >= 0 { close(wfd) }
+    }
+
     func killPane() {
         stateLock.lock()
         if stopped {
@@ -270,43 +313,68 @@ private final class ManagedPane: @unchecked Sendable {
             return
         }
         stopped = true
-        let lfd = listenFD
-        listenFD = -1
+        alive = false
         let cfd = activeClientFD
         activeClientFD = -1
-        let mfd = masterFD
-        masterFD = -1
-        alive = false
+        // NEVER call close(masterFD) or close(listenFD) here while reader/accept threads hold them —
+        // on XNU that deadlocks close() in permanent uninterruptible sleep ('U'). Instead wake both
+        // poll() loops via wakePipe and terminate the child process group so each thread closes its own FD!
+        signalWakePipeLocked()
         stateLock.unlock()
 
-        if lfd >= 0 { close(lfd) }
         unlink(socketPath)
         if cfd >= 0 {
             shutdown(cfd, SHUT_RDWR)
-            close(cfd)
         }
-        if mfd >= 0 { close(mfd) }
 
-        // Terminate the entire process group cleanly
+        // Terminate the entire process group cleanly (SIGHUP -> SIGTERM -> SIGKILL fallback)
         _ = Darwin.kill(-childPID, SIGHUP)
         _ = Darwin.kill(childPID, SIGHUP)
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.4) { [childPID] in
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.15) { [childPID] in
             var st: Int32 = 0
             if waitpid(childPID, &st, WNOHANG) == 0 {
                 _ = Darwin.kill(-childPID, SIGTERM)
                 _ = Darwin.kill(childPID, SIGTERM)
             }
         }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.6) { [childPID] in
+            var st: Int32 = 0
+            if waitpid(childPID, &st, WNOHANG) == 0 {
+                _ = Darwin.kill(-childPID, SIGKILL)
+                _ = Darwin.kill(childPID, SIGKILL)
+            }
+        }
         onFinalCleanup?()
     }
 
     private func runMasterReadLoop() {
+        defer { markLoopFinished() }
         var buf = [UInt8](repeating: 0, count: 32768)
         while true {
             stateLock.lock()
             let mfd = masterFD
+            let wfd = wakeReadFD
+            let isStopped = stopped
             stateLock.unlock()
-            guard mfd >= 0 else { break }
+            guard !isStopped, mfd >= 0 else { break }
+
+            var pfds: [pollfd] = [
+                pollfd(fd: mfd, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wfd, events: Int16(POLLIN), revents: 0),
+            ]
+            let prc = poll(&pfds, nfds_t(wfd >= 0 ? 2 : 1), 500)
+            if prc < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if prc == 0 { continue }
+            if wfd >= 0 && (pfds[1].revents & Int16(POLLIN | POLLHUP | POLLNVAL)) != 0 {
+                break
+            }
+            if (pfds[0].revents & Int16(POLLIN)) == 0 {
+                if (pfds[0].revents & Int16(POLLHUP | POLLERR | POLLNVAL)) != 0 { break }
+                continue
+            }
 
             let n = Darwin.read(mfd, &buf, buf.count)
             if n < 0 {
@@ -314,7 +382,6 @@ private final class ManagedPane: @unchecked Sendable {
                 break
             }
             if n == 0 { break }
-
             // Append to scrollback ring buffer & forward to attached client if any
             clientWriteLock.lock()
             stateLock.lock()
@@ -348,12 +415,19 @@ private final class ManagedPane: @unchecked Sendable {
         // Reap exited child process
         var rawStatus: Int32 = 0
         var finalCode: Int32 = 0
-        if waitpid(childPID, &rawStatus, 0) > 0 {
-            if (rawStatus & 0x7F) == 0 {
-                finalCode = (rawStatus >> 8) & 0xFF
-            } else {
-                finalCode = 128 + (rawStatus & 0x7F)
+        stateLock.lock()
+        let wasExplicitlyStopped = stopped
+        stateLock.unlock()
+        if !wasExplicitlyStopped {
+            if waitpid(childPID, &rawStatus, 0) > 0 {
+                if (rawStatus & 0x7F) == 0 {
+                    finalCode = (rawStatus >> 8) & 0xFF
+                } else {
+                    finalCode = 128 + (rawStatus & 0x7F)
+                }
             }
+        } else {
+            _ = waitpid(childPID, &rawStatus, WNOHANG)
         }
 
         clientWriteLock.lock()
@@ -364,10 +438,9 @@ private final class ManagedPane: @unchecked Sendable {
         masterFD = -1
         let cfd = activeClientFD
         activeClientFD = -1
-        let lfd = listenFD
-        listenFD = -1
         let wasStopped = stopped
         stopped = true
+        signalWakePipeLocked()
         stateLock.unlock()
 
         if cfd >= 0 {
@@ -381,7 +454,6 @@ private final class ManagedPane: @unchecked Sendable {
         clientWriteLock.unlock()
 
         if mfd >= 0 { close(mfd) }
-        if lfd >= 0 { close(lfd) }
         unlink(socketPath)
         if !wasStopped {
             onFinalCleanup?()
@@ -389,11 +461,39 @@ private final class ManagedPane: @unchecked Sendable {
     }
 
     private func runAttachAcceptLoop() {
+        defer {
+            stateLock.lock()
+            let lfd = listenFD
+            listenFD = -1
+            stateLock.unlock()
+            if lfd >= 0 { close(lfd) }
+            markLoopFinished()
+        }
         while true {
             stateLock.lock()
             let lfd = listenFD
+            let wfd = wakeReadFD
+            let isStopped = stopped
             stateLock.unlock()
-            guard lfd >= 0 else { break }
+            guard !isStopped, lfd >= 0 else { break }
+
+            var pfds: [pollfd] = [
+                pollfd(fd: lfd, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wfd, events: Int16(POLLIN), revents: 0),
+            ]
+            let prc = poll(&pfds, nfds_t(wfd >= 0 ? 2 : 1), 500)
+            if prc < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if prc == 0 { continue }
+            if wfd >= 0 && (pfds[1].revents & Int16(POLLIN | POLLHUP | POLLNVAL)) != 0 {
+                break
+            }
+            if (pfds[0].revents & Int16(POLLIN)) == 0 {
+                if (pfds[0].revents & Int16(POLLHUP | POLLERR | POLLNVAL)) != 0 { break }
+                continue
+            }
 
             let cfd = accept(lfd, nil, nil)
             if cfd < 0 {
@@ -695,11 +795,23 @@ signal(SIGHUP, SIG_IGN)
 _ = setsid()
 
 let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
-let runDir = home + "/boo_box/run"
+let baseRoot: String = {
+    if let raw = ProcessInfo.processInfo.environment["BOOBOX_DATA_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !raw.isEmpty {
+        let expanded = (raw as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: expanded, withIntermediateDirectories: true)
+        if let resolved = realpath(expanded, nil) {
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        return expanded
+    }
+    return home + "/boo_box"
+}()
+let runDir = baseRoot + "/run"
 let panesDir = runDir + "/panes"
 let controlSocketPath = runDir + "/booboxd.sock"
 let pidFilePath = runDir + "/booboxd.pid"
-
 let fm = FileManager.default
 try? fm.createDirectory(atPath: panesDir, withIntermediateDirectories: true)
 chmod(runDir, 0o700)
@@ -738,14 +850,12 @@ DispatchQueue.global(qos: .background).async {
     }
 }
 
-// Accept control requests
-while true {
-    let clientFD = accept(controlFD, nil, nil)
-    if clientFD < 0 {
-        if errno == EINTR { continue }
-        break
-    }
-    setCloseOnExec(clientFD)
+// Handle each control client concurrently with bounded timeouts so no op can ever stall booboxd.sock
+@Sendable private func handleControlClient(_ clientFD: Int32) {
+    defer { close(clientFD) }
+    var tv = timeval(tv_sec: 2, tv_usec: 0)
+    _ = setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    _ = setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
     var data = Data()
     var buf = [UInt8](repeating: 0, count: 8192)
@@ -762,14 +872,13 @@ while true {
 
     guard let req = try? JSONDecoder().decode(ControlRequest.self, from: data) else {
         writeJSONLine(clientFD, Data("{\"ok\":false,\"error\":\"invalid_json\"}".utf8))
-        close(clientFD)
-        continue
+        return
     }
 
     switch req.op {
     case "ping":
         state.touch()
-        let resp = "{\"ok\":true,\"pid\":\(getpid()),\"livePanes\":\(state.liveCount())}"
+        let resp = "{\"ok\":true,\"v\":2,\"pid\":\(getpid()),\"livePanes\":\(state.liveCount())}"
         writeJSONLine(clientFD, Data(resp.utf8))
 
     case "spawn":
@@ -815,15 +924,25 @@ while true {
 
     case "shutdown":
         writeJSONLine(clientFD, Data("{\"ok\":true}".utf8))
-        close(clientFD)
         state.killAll()
         unlink(controlSocketPath)
         unlink(pidFilePath)
-        exit(0)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { exit(0) }
 
     default:
         writeJSONLine(clientFD, Data("{\"ok\":false,\"error\":\"unknown_op\"}".utf8))
     }
+}
 
-    close(clientFD)
+// Accept control requests
+while true {
+    let clientFD = accept(controlFD, nil, nil)
+    if clientFD < 0 {
+        if errno == EINTR { continue }
+        break
+    }
+    setCloseOnExec(clientFD)
+    DispatchQueue.global(qos: .userInitiated).async {
+        handleControlClient(clientFD)
+    }
 }

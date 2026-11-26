@@ -144,7 +144,7 @@ struct SidebarView: View {
         HStack(spacing: 6) {
             ProgressView()
                 .controlSize(.mini)
-            Text("Cloning \(projectName)…")
+            Text("\(BooBoxConfigManager.shared.config.general.workspaceMode == .overlay ? "Opening" : "Cloning") \(projectName)…")
                 .font(.system(size: 10.5, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
