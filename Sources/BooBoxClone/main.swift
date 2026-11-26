@@ -61,7 +61,7 @@ private func statSignature(of path: String) -> String? {
 private func runGit(_ arguments: [String], in dir: String, stdinData: Data? = nil) -> (Int32, Data) {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-    proc.arguments = ["-C", dir] + arguments
+    proc.arguments = ["--no-optional-locks", "-C", dir] + arguments
     let outPipe = Pipe()
     proc.standardOutput = outPipe
     proc.standardError = FileHandle.nullDevice
@@ -118,6 +118,25 @@ private func runGitLsFiles(in srcDir: String) -> [String]? {
 }
 
 private func gitHeadCommit(in srcDir: String) -> String {
+    // Fast path: resolve `.git/HEAD` (+ loose ref) directly in Swift (~0.05 ms, zero subprocess fork)
+    let gitDir = srcDir + "/.git"
+    var st = stat()
+    if lstat(gitDir, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR,
+       let headRaw = try? String(contentsOfFile: gitDir + "/HEAD", encoding: .utf8) {
+        let head = headRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if head.hasPrefix("ref:") {
+            let refRel = head.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !refRel.isEmpty,
+               let refRaw = try? String(contentsOfFile: gitDir + "/" + refRel, encoding: .utf8) {
+                let sha = refRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if sha.count == 40 {
+                    return sha
+                }
+            }
+        } else if head.count == 40 {
+            return head
+        }
+    }
     let (status, data) = runGit(["rev-parse", "--verify", "HEAD"], in: srcDir)
     guard status == 0 else { return "" }
     return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -531,31 +550,67 @@ private func writeMeta(_ meta: CloneMeta, to path: String) {
     }
 }
 
-/// Clones an entire directory/file via native APFS `clonefile(2)` in a single kernel call when possible,
+/// Strips secret `.env*` files from an already-cloned directory tree using zero-stat `d_type` traversal,
+/// skipping `.git` and `heavyDirNames` (`node_modules`, `.next`, `target`, etc.) so huge dependency trees
+/// are never walked in userspace.
+private func stripSecretEnvFiles(in dir: String) {
+    for (name, dType) in listDirEntries(at: dir) {
+        if name == ".git" || heavyDirNames.contains(name) { continue }
+        let path = dir + "/" + name
+        if dType == UInt8(DT_DIR) {
+            stripSecretEnvFiles(in: path)
+        } else if dType == UInt8(DT_REG) || dType == UInt8(DT_LNK) {
+            if isSecretEnvFile(name) {
+                unlink(path)
+            }
+        } else if dType == UInt8(DT_UNKNOWN) {
+            var st = stat()
+            guard lstat(path, &st) == 0 else { continue }
+            let ftype = st.st_mode & S_IFMT
+            if ftype == S_IFDIR {
+                stripSecretEnvFiles(in: path)
+            } else if (ftype == S_IFREG || ftype == S_IFLNK) && isSecretEnvFile(name) {
+                unlink(path)
+            }
+        }
+    }
+}
+
+/// Clones an entire directory/file via native APFS `clonefile(2)` in a single kernel call even when
+/// `excludeEnv` is true (stripping any `.env*` files in `dst` afterward while skipping `heavyDirNames`),
 /// falling back to recursive entry-by-entry cloning only if a subtree contains unsupported nodes (e.g. sockets/FIFOs).
 private func cloneSubtreeAPFS(src: String, dst: String, excludeEnv: Bool) {
-    if !excludeEnv {
-        if clonefile(src, dst, 0) == 0 {
-            return
+    let baseName = (src as NSString).lastPathComponent
+    let isHeavyOrGit = (baseName == ".git") || heavyDirNames.contains(baseName)
+    var clonedWhole = false
+    if clonefile(src, dst, 0) == 0 {
+        clonedWhole = true
+    } else if errno == EEXIST {
+        var dstSt = stat()
+        if lstat(dst, &dstSt) == 0 && (dstSt.st_mode & S_IFMT) == S_IFDIR {
+            try? FileManager.default.removeItem(atPath: dst)
+        } else {
+            unlink(dst)
         }
-        let err = errno
-        if err == EEXIST {
+        if clonefile(src, dst, 0) == 0 {
+            clonedWhole = true
+        }
+    }
+    if clonedWhole {
+        if excludeEnv && !isHeavyOrGit {
             var dstSt = stat()
             if lstat(dst, &dstSt) == 0 && (dstSt.st_mode & S_IFMT) == S_IFDIR {
-                try? FileManager.default.removeItem(atPath: dst)
-            } else {
-                unlink(dst)
+                stripSecretEnvFiles(in: dst)
             }
-            if clonefile(src, dst, 0) == 0 { return }
         }
+        return
     }
 
     var st = stat()
     guard lstat(src, &st) == 0 else { return }
     let ftype = st.st_mode & S_IFMT
     if ftype == S_IFREG || ftype == S_IFLNK {
-        let name = (src as NSString).lastPathComponent
-        if excludeEnv && isSecretEnvFile(name) { return }
+        if excludeEnv && isSecretEnvFile(baseName) { return }
         cloneSinglePath(src: src, dst: dst)
     } else if ftype == S_IFDIR {
         mkdirP(dst)
