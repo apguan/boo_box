@@ -425,12 +425,33 @@ private struct SessionRowView: View {
                             .truncationMode(.middle)
                     }
 
-                    if session.hasUnreadBell && !isSelected {
+                    if session.pendingProxyAlert?.decision == "leak_blocked" {
+                        Image(systemName: "exclamationmark.shield.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.red)
+                            .help("Blocked secret exfiltration attempt")
+                    } else if session.isRunningCommand {
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color(red: 0.25, green: 0.84, blue: 0.72))
+                                .frame(width: 5.5, height: 5.5)
+                            if let proc = session.runningProcessName, !proc.isEmpty, proc != "zsh" {
+                                Text(proc)
+                                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(Color(red: 0.25, green: 0.84, blue: 0.72))
+                                    .lineLimit(1)
+                            }
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.14)))
+                        .help("Command running inside sandbox")
+                    } else if session.hasUnreadBell && !isSelected {
                         Circle()
                             .fill(Color.orange)
                             .frame(width: 6, height: 6)
+                            .help("Needs attention")
                     }
-
                     Spacer(minLength: 4)
 
                     if !isRenaming {

@@ -27,6 +27,11 @@ struct MainWorkspaceView: View {
         .background(Color(nsColor: store.themeBackground))
         .ignoresSafeArea(.all, edges: .top)
         .frame(minWidth: 780, minHeight: 500)
+        .overlay {
+            if store.isCommandPaletteOpen {
+                CommandPaletteOverlay(store: store)
+            }
+        }
         .sheet(item: $store.configuringTarget) { target in
             SandboxConfigSheet(store: store, target: target)
         }
@@ -59,6 +64,10 @@ struct MainWorkspaceView: View {
                 UpdateProgressBanner(text: "Downloading boo_box \(version) (\(Int(progress * 100))%)…")
             } else if case .installing(let message) = updateManager.state {
                 UpdateProgressBanner(text: message)
+            }
+
+            if let session = activeSession, let alert = session.pendingProxyAlert {
+                ProxyAlertBanner(store: store, session: session, alert: alert)
             }
 
             ZStack {
@@ -138,6 +147,87 @@ private struct UpdateProgressBanner: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color.accentColor.opacity(0.08))
+        .overlay(alignment: .bottom) {
+            Divider().opacity(0.4)
+        }
+    }
+}
+
+private struct ProxyAlertBanner: View {
+    @ObservedObject var store: SessionStore
+    @ObservedObject var session: TerminalSession
+    let alert: ProxyAuditEventItem
+
+    private var isLeak: Bool {
+        alert.decision == "leak_blocked"
+    }
+
+    private var isOffline: Bool {
+        alert.reason.lowercased().contains("offline")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isLeak ? "exclamationmark.shield.fill" : "hand.raised.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(isLeak ? Color.red : Color.orange)
+
+            if isLeak {
+                Text("Blocked secret exfiltration → \(alert.host) (\(alert.reason))")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(Color.red)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            } else {
+                Text("Blocked \(alert.host) — \(alert.reason)")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer()
+
+            if isLeak {
+                Button("Inspect") {
+                    SettingsNavState.shared.selectedTab = .secretsNetwork
+                    store.openSettings()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .controlSize(.mini)
+            } else if isOffline {
+                Button("Configure") {
+                    store.openSandboxConfig(for: session.id)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+            } else {
+                Button("Allow (this tab)") {
+                    store.allowBlockedDomainForSession(alert.host, sessionID: session.id)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+
+                Button("Allow globally") {
+                    store.allowBlockedDomainGlobally(alert.host, sessionID: session.id)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+            }
+
+            Button {
+                store.dismissProxyAlert(for: session.id)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background((isLeak ? Color.red : Color.orange).opacity(isLeak ? 0.16 : 0.11))
         .overlay(alignment: .bottom) {
             Divider().opacity(0.4)
         }

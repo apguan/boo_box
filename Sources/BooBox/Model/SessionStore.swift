@@ -19,7 +19,7 @@ enum SidebarPosition: String, CaseIterable, Sendable {
     }
 }
 
-enum SessionMode: Equatable, Sendable {
+enum SessionMode: String, Codable, Equatable, Sendable {
     case sandbox    // Default: Native macOS Seatbelt sandbox persisted in ~/boo_box/sessions/<id>/
     case linuxVM    // Private VM: Clean ephemeral arm64 Linux 6.18 microVM (zero Mac files, wiped on close)
     case rawHost    // Unsandboxed host macOS shell
@@ -64,15 +64,20 @@ final class TerminalPane: ObservableObject, Identifiable {
     @Published var progress: TerminalProgress?
     @Published var hasExited: Bool = false
     @Published var isFocused: Bool = false
+    /// Non-nil when this pane's shell/sandbox runs inside detached `booboxd`.
+    var daemonPaneID: String?
 
     var onBell: (() -> Void)?
+    var onDesktopNotification: ((String, String) -> Void)?
+    var onCommandFinished: ((Int, UInt64) -> Void)?
     var onBecameFocused: (() -> Void)?
     var onTitleChange: ((String) -> Void)?
     var onPwdChange: ((String) -> Void)?
 
-    init(launchOptions: SurfaceLaunchOptions = SurfaceLaunchOptions()) {
+    init(launchOptions: SurfaceLaunchOptions = SurfaceLaunchOptions(), daemonPaneID: String? = nil) {
         let paneID = UUID()
         self.id = paneID
+        self.daemonPaneID = daemonPaneID
         self.surfaceView = TerminalSurfaceView(paneID: paneID, launchOptions: launchOptions)
 
         self.surfaceView.onTitleChange = { [weak self] newTitle in
@@ -89,6 +94,12 @@ final class TerminalPane: ObservableObject, Identifiable {
         self.surfaceView.onBell = { [weak self] in
             self?.onBell?()
         }
+        self.surfaceView.onDesktopNotification = { [weak self] title, body in
+            self?.onDesktopNotification?(title, body)
+        }
+        self.surfaceView.onCommandFinished = { [weak self] exitCode, durationNs in
+            self?.onCommandFinished?(exitCode, durationNs)
+        }
         self.surfaceView.onFocusChange = { [weak self] focused in
             guard let self else { return }
             self.isFocused = focused
@@ -103,6 +114,13 @@ final class TerminalPane: ObservableObject, Identifiable {
 
     func destroy() {
         surfaceView.destroySurface()
+    }
+
+    func killDaemonPane() {
+        if let dp = daemonPaneID {
+            daemonPaneID = nil
+            DaemonClient.shared.killPane(dp)
+        }
     }
 }
 
@@ -200,6 +218,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var rootNode: SplitNode
     @Published var focusedPaneID: UUID
     @Published var hasUnreadBell: Bool = false
+    @Published var isRunningCommand: Bool = false
+    @Published var runningProcessName: String?
+    @Published var isDetachedLive: Bool = false
+    @Published var pendingProxyAlert: ProxyAuditEventItem?
     @Published var macSandbox: MacSandboxSession?
     @Published var overrides: SandboxOverrideConfig = .default
     @Published var vmState: VMState?
@@ -321,12 +343,28 @@ final class TerminalSession: ObservableObject, Identifiable {
         activeProgress = pane?.progress ?? rootNode.allPanes.compactMap(\.progress).first
     }
 
-    func destroyAllPanes() {
+    func destroyAllPanes(killDaemonPanes: Bool = false) {
         paneCancellables.removeAll()
         for pane in rootNode.allPanes {
+            if killDaemonPanes {
+                pane.killDaemonPane()
+            }
             pane.destroy()
         }
     }
+}
+
+private struct PersistedOpenSession: Codable {
+    let id: UUID
+    let mode: SessionMode
+    let sandboxShortID: String?
+    let daemonPaneID: String?
+    let rawWorkingDirectory: String?
+}
+
+private struct PersistedWorkspaceState: Codable {
+    let sessions: [PersistedOpenSession]
+    let selectedSessionID: UUID?
 }
 
 @MainActor
@@ -373,9 +411,18 @@ final class SessionStore: ObservableObject {
     @Published var activeProjectExcludeEnvOverride: Bool?
     @Published var cloningProjectName: String?
     @Published var configuringTarget: SandboxConfigTarget?
+    @Published var isCommandPaletteOpen: Bool = false
     let stageView = TerminalStageView()
     var onOpenSettings: (() -> Void)?
     var onThemeBackgroundChanged: ((NSColor) -> Void)?
+
+    private var monitorTimer: Timer?
+    private var lastProxyEventSeq: UInt64 = 0
+    private var dismissedProxyAlertKeys: Set<String> = []
+    private let persistedStateURL: URL = {
+        let realHome = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
+        return realHome.appendingPathComponent("boo_box/run/last-open-sessions.json")
+    }()
     var filteredSessions: [TerminalSession] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return sessions }
@@ -420,7 +467,10 @@ final class SessionStore: ObservableObject {
         self.themeBackground = GhosttyRuntime.shared.themeColors.background
         self.stageView.backgroundColor = self.themeBackground
         wireRuntimeCallbacks()
-        refreshSavedMacSessions()
+        NotificationManager.shared.onSelectSession = { [weak self] sessionID in
+            self?.selectSession(sessionID)
+        }
+        startLiveMonitors()
     }
     private func wireRuntimeCallbacks() {
         GhosttyRuntime.shared.onHostAction = { [weak self] action, surfaceView in
@@ -727,21 +777,72 @@ final class SessionStore: ObservableObject {
         return startSessionWithMacSandbox(refreshed, sequenceNumber: seq)
     }
 
-    private func startSessionWithMacSandbox(_ sandbox: MacSandboxSession, sequenceNumber: Int) -> TerminalSession {
+    private func makeSandboxPane(
+        for sandbox: MacSandboxSession,
+        cwd: String,
+        context: ghostty_surface_context_e,
+        reattachPane: DaemonPaneStatus? = nil
+    ) -> TerminalPane {
+        let useDaemon = BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+        if useDaemon {
+            if let existing = reattachPane, existing.alive,
+               let attachCmd = DaemonClient.shared.buildAttachCommand(socketPath: existing.socketPath, cwd: cwd) {
+                // Ensure proxy policy is synced for this reattached session
+                _ = SecretsVaultManager.shared.sandboxEnvironment(for: sandbox.shortID, overrides: sandbox.overrides)
+                let opts = SurfaceLaunchOptions(
+                    workingDirectory: NSHomeDirectory(),
+                    command: attachCmd,
+                    environmentVariables: ["BOOBOX_MODE": "mac_sandbox"],
+                    context: context
+                )
+                return TerminalPane(launchOptions: opts, daemonPaneID: existing.paneId)
+            }
+            let paneID = UUID().uuidString
+            let cmd = MacOSSandboxManager.shared.launchCommand(for: sandbox)
+            if let sockPath = DaemonClient.shared.spawnPane(paneId: paneID, sessionId: sandbox.shortID, cwd: cwd, command: cmd),
+               let attachCmd = DaemonClient.shared.buildAttachCommand(socketPath: sockPath, cwd: cwd) {
+                let opts = SurfaceLaunchOptions(
+                    workingDirectory: NSHomeDirectory(),
+                    command: attachCmd,
+                    environmentVariables: ["BOOBOX_MODE": "mac_sandbox"],
+                    context: context
+                )
+                return TerminalPane(launchOptions: opts, daemonPaneID: paneID)
+            }
+        }
+
         let opts = SurfaceLaunchOptions(
-            workingDirectory: sandbox.workspaceDir.path,
+            workingDirectory: cwd,
             command: MacOSSandboxManager.shared.launchCommand(for: sandbox),
             environmentVariables: MacOSSandboxManager.shared.launchEnvironment(for: sandbox),
-            context: GHOSTTY_SURFACE_CONTEXT_TAB
+            context: context
         )
-        let pane = TerminalPane(launchOptions: opts)
+        return TerminalPane(launchOptions: opts)
+    }
+
+    private func startSessionWithMacSandbox(
+        _ sandbox: MacSandboxSession,
+        sequenceNumber: Int,
+        reattachPane: DaemonPaneStatus? = nil,
+        focusImmediately: Bool = true
+    ) -> TerminalSession {
+        let pane = makeSandboxPane(
+            for: sandbox,
+            cwd: sandbox.workspaceDir.path,
+            context: GHOSTTY_SURFACE_CONTEXT_TAB,
+            reattachPane: reattachPane
+        )
         let session = TerminalSession(id: sandbox.id, mode: .sandbox, sequenceNumber: sequenceNumber, initialPane: pane)
         session.macSandbox = sandbox
         session.overrides = sandbox.overrides
+        session.isDetachedLive = pane.daemonPaneID != nil
         attachPaneHandlers(pane, in: session)
         sessions.append(session)
-        selectedSessionID = session.id
-        stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
+        if focusImmediately || selectedSessionID == nil {
+            selectedSessionID = session.id
+        }
+        stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: focusImmediately)
+        saveOpenSessionsState()
         return session
     }
 
@@ -860,22 +961,19 @@ final class SessionStore: ObservableObject {
             ? currentPwd!
             : sandbox.workspaceDir.path
 
-        session.destroyAllPanes()
-        let opts = SurfaceLaunchOptions(
-            workingDirectory: launchDir,
-            command: MacOSSandboxManager.shared.launchCommand(for: sandbox),
-            environmentVariables: MacOSSandboxManager.shared.launchEnvironment(for: sandbox),
-            context: GHOSTTY_SURFACE_CONTEXT_TAB
-        )
-        let freshPane = TerminalPane(launchOptions: opts)
+        session.destroyAllPanes(killDaemonPanes: true)
+        let freshPane = makeSandboxPane(for: sandbox, cwd: launchDir, context: GHOSTTY_SURFACE_CONTEXT_TAB)
         attachPaneHandlers(freshPane, in: session)
         session.observePane(freshPane)
+        session.isDetachedLive = freshPane.daemonPaneID != nil
+        session.pendingProxyAlert = nil
         session.rootNode = .leaf(freshPane)
         session.focusedPaneID = freshPane.id
         session.refreshMirroredState()
 
         stageView.rebuildSession(session)
         stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
+        saveOpenSessionsState()
     }
     func deleteActiveSessionPermanently(_ id: UUID) {
         guard let session = sessions.first(where: { $0.id == id }),
@@ -886,7 +984,9 @@ final class SessionStore: ObservableObject {
         guard confirmPermanentSessionDeletion(name: session.displayTitle, shortID: sb.shortID) else { return }
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         let removed = sessions.remove(at: idx)
-        removed.destroyAllPanes()
+        removed.destroyAllPanes(killDaemonPanes: true)
+        DaemonClient.shared.killSession(sb.shortID)
+        SecretsVaultManager.shared.unregisterSession(sb.shortID)
         MacOSSandboxManager.shared.deleteSessionDir(sb)
         stageView.removeSession(id)
 
@@ -899,6 +999,8 @@ final class SessionStore: ObservableObject {
             }
         }
         stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: !sessions.isEmpty)
+        updateDockBadge()
+        saveOpenSessionsState()
         refreshSavedMacSessions()
     }
 
@@ -999,7 +1101,9 @@ final class SessionStore: ObservableObject {
         guard let session = sessions.first(where: { $0.id == id }) else { return }
         selectedSessionID = id
         session.hasUnreadBell = false
+        updateDockBadge()
         stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
+        saveOpenSessionsState()
     }
 
     func selectSession(at index: Int) {
@@ -1018,12 +1122,13 @@ final class SessionStore: ObservableObject {
     func closeSession(_ id: UUID) {
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         let removed = sessions.remove(at: idx)
-        removed.destroyAllPanes()
+        removed.destroyAllPanes(killDaemonPanes: true)
 
         if removed.mode == .linuxVM {
             MicroVMManager.shared.destroyVM(for: id)
         }
         if let sb = removed.macSandbox {
+            DaemonClient.shared.killSession(sb.shortID)
             SecretsVaultManager.shared.unregisterSession(sb.shortID)
             // Keep persisted session directory if files were saved in workspace/; auto-delete if empty.
             if MacOSSandboxManager.shared.workspaceFileCount(for: sb) == 0 {
@@ -1041,6 +1146,8 @@ final class SessionStore: ObservableObject {
             }
         }
         stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: !sessions.isEmpty)
+        updateDockBadge()
+        saveOpenSessionsState()
         if removed.macSandbox != nil {
             refreshSavedMacSessions()
         }
@@ -1117,12 +1224,20 @@ final class SessionStore: ObservableObject {
             if let sb = session.macSandbox {
                 let candidate = currentPane.pwd ?? sb.workspaceDir.path
                 let splitCwd = candidate.hasPrefix(sb.sessionDir.path) ? candidate : sb.workspaceDir.path
-                opts = SurfaceLaunchOptions(
-                    workingDirectory: splitCwd,
-                    command: MacOSSandboxManager.shared.launchCommand(for: sb),
-                    environmentVariables: MacOSSandboxManager.shared.launchEnvironment(for: sb),
-                    context: GHOSTTY_SURFACE_CONTEXT_SPLIT
+                let newPane = makeSandboxPane(for: sb, cwd: splitCwd, context: GHOSTTY_SURFACE_CONTEXT_SPLIT)
+                attachPaneHandlers(newPane, in: session)
+                session.observePane(newPane)
+                session.rootNode = session.rootNode.splitting(
+                    paneID: currentPane.id,
+                    axis: axis,
+                    newPane: newPane,
+                    insertBefore: insertBefore
                 )
+                session.focusedPaneID = newPane.id
+                session.refreshMirroredState()
+                stageView.rebuildSession(session)
+                stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
+                return
             } else {
                 return
             }
@@ -1189,9 +1304,9 @@ final class SessionStore: ObservableObject {
         }
 
         session.stopObservingPane(paneID)
+        targetPane.killDaemonPane()
         targetPane.destroy()
         session.rootNode = remaining
-
         if session.focusedPaneID == paneID, let fallback = remaining.allPanes.first {
             session.focusedPaneID = fallback.id
         }
@@ -1258,13 +1373,248 @@ final class SessionStore: ObservableObject {
         onThemeBackgroundChanged?(themeBackground)
     }
 
-    func shutdownAll() {
+    // MARK: - Command Palette (`⌘P`)
+
+    func toggleCommandPalette() {
+        isCommandPaletteOpen.toggle()
+        if !isCommandPaletteOpen {
+            refocusActiveTerminal()
+        }
+    }
+
+    func closeCommandPalette() {
+        guard isCommandPaletteOpen else { return }
+        isCommandPaletteOpen = false
+        refocusActiveTerminal()
+    }
+
+    // MARK: - 1-Click Proxy Blocked-Domain / Leak Toast Actions
+
+    func allowBlockedDomainForSession(_ domain: String, sessionID: UUID) {
+        let clean = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !clean.isEmpty,
+              let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        var next = session.overrides
+        if !next.extraAllowedDomains.contains(where: { $0.lowercased() == clean }) {
+            next.extraAllowedDomains.append(clean)
+        }
+        session.pendingProxyAlert = nil
+        applySandboxOverrides(next, to: sessionID, restart: false)
+    }
+
+    func allowBlockedDomainGlobally(_ domain: String, sessionID: UUID) {
+        let clean = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !clean.isEmpty else { return }
+        var domains = BooBoxConfigManager.shared.config.secretsNetwork.customAllowedDomains
+        if !domains.contains(where: { $0.lowercased() == clean }) {
+            domains.append(clean)
+            BooBoxConfigManager.shared.config.secretsNetwork.customAllowedDomains = domains
+        }
+        for s in sessions where s.pendingProxyAlert?.host.lowercased() == clean {
+            s.pendingProxyAlert = nil
+        }
+    }
+
+    func dismissProxyAlert(for sessionID: UUID) {
+        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        if let ev = session.pendingProxyAlert {
+            dismissedProxyAlertKeys.insert("\(ev.sessionId)|\(ev.host)|\(ev.decision)")
+        }
+        session.pendingProxyAlert = nil
+    }
+
+    // MARK: - Open Session Persistence & Detached Reattach (`booboxd`)
+
+    var hasLiveDaemonPanes: Bool {
+        sessions.contains { s in
+            s.rootNode.allPanes.contains { $0.daemonPaneID != nil }
+        }
+    }
+
+    func saveOpenSessionsState() {
+        let entries: [PersistedOpenSession] = sessions.compactMap { s in
+            switch s.mode {
+            case .sandbox:
+                guard let sb = s.macSandbox else { return nil }
+                return PersistedOpenSession(
+                    id: s.id,
+                    mode: .sandbox,
+                    sandboxShortID: sb.shortID,
+                    daemonPaneID: s.focusedPane?.daemonPaneID,
+                    rawWorkingDirectory: nil
+                )
+            case .rawHost:
+                return PersistedOpenSession(
+                    id: s.id,
+                    mode: .rawHost,
+                    sandboxShortID: nil,
+                    daemonPaneID: nil,
+                    rawWorkingDirectory: s.focusedPane?.pwd ?? NSHomeDirectory()
+                )
+            case .linuxVM:
+                return nil // Ephemeral Linux VMs always boot clean
+            }
+        }
+        let state = PersistedWorkspaceState(sessions: entries, selectedSessionID: selectedSessionID)
+        let url = persistedStateURL
+        if let data = try? JSONEncoder().encode(state) {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    @discardableResult
+    func restoreLastOpenSessionsIfEnabled() -> Bool {
+        guard BooBoxConfigManager.shared.config.general.restoreSessionsOnLaunch,
+              let data = try? Data(contentsOf: persistedStateURL),
+              let saved = try? JSONDecoder().decode(PersistedWorkspaceState.self, from: data),
+              !saved.sessions.isEmpty else {
+            return false
+        }
+
+        let liveDaemonPanes = Dictionary(
+            uniqueKeysWithValues: DaemonClient.shared.listPanes().filter(\.alive).map { ($0.paneId, $0) }
+        )
+        var restoredAny = false
+
+        for entry in saved.sessions {
+            switch entry.mode {
+            case .sandbox:
+                guard let shortID = entry.sandboxShortID,
+                      let sb = MacOSSandboxManager.shared.loadSession(shortID: shortID) else { continue }
+                let livePane = entry.daemonPaneID.flatMap { liveDaemonPanes[$0] }
+                let readySandbox: MacSandboxSession
+                if livePane != nil {
+                    readySandbox = sb
+                } else if let refreshed = try? MacOSSandboxManager.shared.prepareForResume(sb) {
+                    readySandbox = refreshed
+                } else {
+                    continue
+                }
+                let seq = nextAvailableSequenceNumber(for: .sandbox)
+                _ = startSessionWithMacSandbox(
+                    readySandbox,
+                    sequenceNumber: seq,
+                    reattachPane: livePane,
+                    focusImmediately: false
+                )
+                restoredAny = true
+
+            case .rawHost:
+                let dir = entry.rawWorkingDirectory ?? NSHomeDirectory()
+                let validDir = FileManager.default.fileExists(atPath: dir) ? dir : NSHomeDirectory()
+                _ = newSession(mode: .rawHost, workingDirectory: validDir)
+                restoredAny = true
+
+            case .linuxVM:
+                break
+            }
+        }
+
+        if restoredAny {
+            if let wanted = saved.selectedSessionID, sessions.contains(where: { $0.id == wanted }) {
+                selectedSessionID = wanted
+            } else {
+                selectedSessionID = sessions.first?.id
+            }
+            stageView.sync(sessions: sessions, selectedSessionID: selectedSessionID, focusActive: true)
+            saveOpenSessionsState()
+        }
+        return restoredAny
+    }
+
+    func shutdownAll(preserveDaemonPanes: Bool = true) {
+        monitorTimer?.invalidate()
+        monitorTimer = nil
+        saveOpenSessionsState()
+        let killDaemons = !preserveDaemonPanes || !BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
         for session in sessions {
-            session.destroyAllPanes()
+            session.destroyAllPanes(killDaemonPanes: killDaemons)
         }
         sessions.removeAll()
         selectedSessionID = nil
+        NotificationManager.shared.updateDockBadge(unreadCount: 0)
         MicroVMManager.shared.shutdownAll()
+    }
+
+    // MARK: - Live Daemon Busy-Status & Proxy Alert Monitors
+
+    private func startLiveMonitors() {
+        monitorTimer?.invalidate()
+        monitorTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pollLiveStatusOnce()
+            }
+        }
+    }
+
+    private func pollLiveStatusOnce() {
+        guard !sessions.isEmpty else { return }
+
+        // 1. Poll `booboxd` for live foreground running command status per detached sandbox tab
+        if hasLiveDaemonPanes {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let panes = DaemonClient.shared.listPanes()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let byID = Dictionary(uniqueKeysWithValues: panes.map { ($0.paneId, $0) })
+                    for session in self.sessions {
+                        var anyBusy = false
+                        var procName: String? = nil
+                        for pane in session.rootNode.allPanes {
+                            if let dp = pane.daemonPaneID, let st = byID[dp], st.alive, st.fgBusy {
+                                anyBusy = true
+                                if procName == nil { procName = st.fgName }
+                            }
+                        }
+                        if session.isRunningCommand != anyBusy {
+                            session.isRunningCommand = anyBusy
+                        }
+                        if session.runningProcessName != procName {
+                            session.runningProcessName = procName
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Poll `boobox-proxy` incrementally for blocked-domain and secret-leak events
+        if SecretsVaultManager.shared.currentProxyPort != nil {
+            let since = lastProxyEventSeq
+            SecretsVaultManager.shared.fetchAuditEventsSince(since) { [weak self] events in
+                guard let self, !events.isEmpty else { return }
+                for ev in events {
+                    if let s = ev.seq, s > self.lastProxyEventSeq {
+                        self.lastProxyEventSeq = s
+                    }
+                    guard ev.decision == "blocked" || ev.decision == "leak_blocked" else { continue }
+                    let dismissKey = "\(ev.sessionId)|\(ev.host)|\(ev.decision)"
+                    if ev.decision != "leak_blocked" && self.dismissedProxyAlertKeys.contains(dismissKey) {
+                        continue
+                    }
+                    guard let target = self.sessions.first(where: { $0.macSandbox?.shortID == ev.sessionId }) else {
+                        continue
+                    }
+                    target.pendingProxyAlert = ev
+                    if ev.decision == "leak_blocked" {
+                        target.hasUnreadBell = true
+                        self.updateDockBadge()
+                        NotificationManager.shared.postSessionNotification(
+                            sessionID: target.id,
+                            title: "Blocked secret exfiltration",
+                            body: "\(ev.host) — \(ev.reason)",
+                            subtitle: target.displayTitle,
+                            isUrgent: true
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func updateDockBadge() {
+        let unread = sessions.filter { $0.hasUnreadBell && $0.id != selectedSessionID }.count
+        NotificationManager.shared.updateDockBadge(unreadCount: unread)
     }
 
     // MARK: - Internal Helpers
@@ -1272,8 +1622,58 @@ final class SessionStore: ObservableObject {
     private func attachPaneHandlers(_ pane: TerminalPane, in session: TerminalSession) {
         pane.onBell = { [weak self, weak session] in
             guard let self, let session else { return }
-            if self.selectedSessionID != session.id {
-                session.hasUnreadBell = true
+            let isBackground = (self.selectedSessionID != session.id) || !NSApp.isActive
+            if isBackground {
+                if self.selectedSessionID != session.id {
+                    session.hasUnreadBell = true
+                }
+                self.updateDockBadge()
+                NotificationManager.shared.postSessionNotification(
+                    sessionID: session.id,
+                    title: session.displayTitle,
+                    body: "Session needs attention"
+                )
+            }
+        }
+
+        pane.onDesktopNotification = { [weak self, weak session] title, body in
+            guard let self, let session else { return }
+            let isBackground = (self.selectedSessionID != session.id) || !NSApp.isActive
+            if isBackground {
+                if self.selectedSessionID != session.id {
+                    session.hasUnreadBell = true
+                }
+                self.updateDockBadge()
+                let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+                NotificationManager.shared.postSessionNotification(
+                    sessionID: session.id,
+                    title: cleanTitle.isEmpty ? session.displayTitle : cleanTitle,
+                    body: cleanBody.isEmpty ? "Agent notification" : cleanBody,
+                    subtitle: cleanTitle.isEmpty ? nil : session.displayTitle
+                )
+            }
+        }
+
+        pane.onCommandFinished = { [weak self, weak session] exitCode, durationNs in
+            guard let self, let session else { return }
+            session.isRunningCommand = false
+            session.runningProcessName = nil
+            // Notify on unfocused/background commands that ran at least 5 seconds
+            let secs = Double(durationNs) / 1_000_000_000.0
+            let isBackground = (self.selectedSessionID != session.id) || !NSApp.isActive
+            if secs >= 5.0 && isBackground {
+                if self.selectedSessionID != session.id {
+                    session.hasUnreadBell = true
+                }
+                self.updateDockBadge()
+                let durStr = secs >= 60 ? String(format: "%.0fm %.0fs", floor(secs / 60), secs.truncatingRemainder(dividingBy: 60)) : String(format: "%.1fs", secs)
+                let msg = exitCode == 0 ? "Command finished in \(durStr)" : "Command exited (\(exitCode)) after \(durStr)"
+                NotificationManager.shared.postSessionNotification(
+                    sessionID: session.id,
+                    title: session.displayTitle,
+                    body: msg
+                )
             }
         }
 
@@ -1323,6 +1723,9 @@ final class SessionStore: ObservableObject {
             default:
                 if target >= 1 { selectSession(at: target - 1) }
             }
+            return true
+        case .toggleCommandPalette:
+            toggleCommandPalette()
             return true
         case .reloadConfig:
             reloadGhosttyConfig()

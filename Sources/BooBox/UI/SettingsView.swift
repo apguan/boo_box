@@ -161,6 +161,30 @@ private struct GeneralSettingsTab: View {
                     Divider()
 
                     SettingsToggleRow(
+                        title: "Persistent detached sessions (booboxd)",
+                        subtitle: "Runs macOS Sandbox shells & coding agents inside a detached PTY daemon so live processes survive app quits, crashes, and auto-updates with scrollback replay.",
+                        isOn: $configManager.config.general.persistentSessionsEnabled
+                    )
+
+                    Divider()
+
+                    SettingsToggleRow(
+                        title: "Reopen active sessions on launch",
+                        subtitle: "Automatically restores your open tabs (reattaching straight to live booboxd sessions) and remembers window size/position across restarts.",
+                        isOn: $configManager.config.general.restoreSessionsOnLaunch
+                    )
+
+                    Divider()
+
+                    SettingsToggleRow(
+                        title: "macOS notifications for background tabs",
+                        subtitle: "Shows clickable notifications and a Dock badge when unfocused tabs finish long commands (≥5s), ring bells, emit agent alerts, or block secret leaks.",
+                        isOn: $configManager.config.general.desktopNotificationsEnabled
+                    )
+
+                    Divider()
+
+                    SettingsToggleRow(
                         title: "Confirm before permanently deleting sessions",
                         subtitle: "Shows a warning alert explaining that the entire session folder will be deleted. Re-enable this here if you previously checked \"Don't ask again\".",
                         isOn: $configManager.config.general.confirmBeforeDeletingSession
@@ -174,7 +198,6 @@ private struct GeneralSettingsTab: View {
                         isOn: $configManager.config.general.confirmOpeningWebLinks
                     )
                 }
-
                 SettingsCard(title: "Updates (\(updateManager.repoSlug))") {
                     VStack(alignment: .leading, spacing: 10) {
                         SettingsToggleRow(

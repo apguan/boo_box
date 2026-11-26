@@ -22,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Schedule automatic GitHub update checks from `apguan/boo_box` if enabled in Settings
         UpdateManager.shared.startIfEnabled()
+        // Configure clickable macOS desktop notifications for background sessions
+        NotificationManager.shared.setup()
 
         do {
             try GhosttyRuntime.shared.start()
@@ -83,13 +85,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 2. Process direct CLI arguments (`--dir <path>`, `--no-env`, `--scratch`)
         handleCommandLineArguments()
 
-        // 3. Defer default scratch tab one runloop tick so cold-launch `open -a boo_box boobox://...`
-        //    doesn't also create an extra empty session tab.
+        // 3. Restore previously open sessions (reattaching straight to live `booboxd` shells/agents!)
+        //    or create a fresh default scratch tab if none were restored and no CLI target was passed.
         DispatchQueue.main.async { [weak self] in
             guard let self, let store = self.store else { return }
             if !self.handledStartupTarget && store.sessions.isEmpty && store.cloningProjectName == nil {
-                store.newSession(mode: .sandbox)
+                let restored = store.restoreLastOpenSessionsIfEnabled()
+                if !restored {
+                    store.newSession(mode: .sandbox)
+                }
             }
+            store.refreshSavedMacSessions()
         }
 
         NSApp.activate(ignoringOtherApps: true)
@@ -230,11 +236,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         ipcServer?.stop()
         ipcServer = nil
-        SecretsVaultManager.shared.stop()
-        store?.shutdownAll()
+        let preserveDetached = (store?.hasLiveDaemonPanes == true)
+            && BooBoxConfigManager.shared.config.general.persistentSessionsEnabled
+        store?.shutdownAll(preserveDaemonPanes: preserveDetached)
+        // Keep boobox-proxy alive across restarts/auto-updates when detached booboxd agents are still running!
+        if !preserveDetached {
+            SecretsVaultManager.shared.stop()
+        }
         GhosttyRuntime.shared.shutdown()
     }
-
     func windowDidBecomeKey(_ notification: Notification) {
         GhosttyRuntime.shared.syncColorScheme()
         if (notification.object as? NSWindow) === mainWindow {
@@ -270,8 +280,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = hostingView
         window.delegate = self
         window.center()
+        window.setFrameAutosaveName("BooBoxMainWindow")
         window.makeKeyAndOrderFront(nil)
-
         self.mainWindow = window
     }
 
@@ -319,6 +329,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         renameItem.keyEquivalentModifierMask = [.command, .shift]
         let searchItem = sessionMenu.addItem(withTitle: "Search Sessions…", action: #selector(searchSessions(_:)), keyEquivalent: "f")
         searchItem.keyEquivalentModifierMask = [.command, .shift]
+        let paletteItem = sessionMenu.addItem(withTitle: "Quick Switcher & Commands…", action: #selector(toggleCommandPalette(_:)), keyEquivalent: "p")
+        paletteItem.keyEquivalentModifierMask = [.command]
         sessionMenu.addItem(.separator())
         sessionMenu.addItem(withTitle: "Split Right", action: #selector(splitRight(_:)), keyEquivalent: "d")
         let splitDown = sessionMenu.addItem(withTitle: "Split Down", action: #selector(splitDown(_:)), keyEquivalent: "d")
@@ -493,6 +505,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func searchSessions(_ sender: Any?) {
         store?.focusSessionSearch()
+    }
+
+    @objc private func toggleCommandPalette(_ sender: Any?) {
+        store?.toggleCommandPalette()
     }
 
     private func showSettingsWindow() {
