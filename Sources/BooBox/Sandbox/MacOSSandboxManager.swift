@@ -760,8 +760,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             )
             let count = workspaceFileCount(for: sandbox)
             if count == 0 {
-                // Clean up empty abandoned session dirs automatically
-                try? fm.removeItem(at: resolvedDir)
+                // Clean up empty abandoned session dirs asynchronously (never stall sidebar refresh)
+                deleteSessionDir(sandbox)
             } else {
                 items.append(SavedMacSandboxItem(sandbox: sandbox, fileCount: count))
             }
@@ -854,6 +854,16 @@ final class MacOSSandboxManager: @unchecked Sendable {
             "BOOBOX_SESSION_ID": sandbox.shortID,
             "BOOBOX_WORKSPACE": sandbox.workspaceDir.path,
             "BOOBOX_CLEAR_BANNER": "1",
+            // Fast monorepo Git defaults inside sandboxes (no .git/config mutation; disables fsmonitor daemon sockets inside Seatbelt)
+            "GIT_CONFIG_COUNT": "4",
+            "GIT_CONFIG_KEY_0": "core.preloadIndex",
+            "GIT_CONFIG_VALUE_0": "true",
+            "GIT_CONFIG_KEY_1": "core.untrackedCache",
+            "GIT_CONFIG_VALUE_1": "true",
+            "GIT_CONFIG_KEY_2": "feature.manyFiles",
+            "GIT_CONFIG_VALUE_2": "true",
+            "GIT_CONFIG_KEY_3": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_3": "false",
             "PATH": buildSandboxPATH(for: sandbox, config: cfg),
         ]
         if persistentTools {
@@ -1037,6 +1047,9 @@ final class MacOSSandboxManager: @unchecked Sendable {
         let rmShimURL = booboxBinDir.appendingPathComponent("rm")
         try Self.rmShimScript.write(to: rmShimURL, atomically: true, encoding: .utf8)
         chmod(rmShimURL.path, 0o555)
+        let cpShimURL = booboxBinDir.appendingPathComponent("cp")
+        try Self.cpShimScript.write(to: cpShimURL, atomically: true, encoding: .utf8)
+        chmod(cpShimURL.path, 0o555)
         let zshrcURL = homeDir.appendingPathComponent(".zshrc")
         try generateSandboxZshrc(for: sandbox, config: cfg).write(to: zshrcURL, atomically: true, encoding: .utf8)
         let meta = MacSandboxMetadata(
@@ -1575,6 +1588,57 @@ final class MacOSSandboxManager: @unchecked Sendable {
     exit "$fallback_rc"
     """
 
+    /// APFS copy-on-write shim for recursive `cp` (`cp -r` / `-R` / `-a`) inside sandboxes.
+    ///
+    /// Attempts `/bin/cp -c` (kernel `clonefile(2)`, 0 extra SSD blocks, 10-100x faster on large trees)
+    /// when the target does not already exist and flags are CoW-safe; transparently falls back to `/bin/cp`
+    /// for non-recursive, cross-volume, interactive/verbose, or existing-target copies. Opt out with `BOOBOX_NO_COW_CP=1`.
+    private static let cpShimScript = """
+    #!/bin/sh
+    if [ "${BOOBOX_NO_COW_CP:-0}" = "1" ]; then
+        exec /bin/cp "$@"
+    fi
+    recursive=0
+    unsupported=0
+    after_dd=0
+    arg_count=0
+    last_arg=""
+    for arg in "$@"; do
+        last_arg="$arg"
+        if [ "$after_dd" -eq 1 ]; then
+            arg_count=$((arg_count + 1))
+            continue
+        fi
+        case "$arg" in
+            --) after_dd=1 ;;
+            -*)
+                chars="${arg#-}"
+                [ -z "$chars" ] && continue
+                while [ -n "$chars" ]; do
+                    c="${chars%"${chars#?}"}"
+                    chars="${chars#?}"
+                    case "$c" in
+                        r|R|a) recursive=1 ;;
+                        p|P|f) ;;
+                        *) unsupported=1 ;;
+                    esac
+                done
+                ;;
+            *)
+                after_dd=1
+                arg_count=$((arg_count + 1))
+                ;;
+        esac
+    done
+    # Only fast-path exact 2-operand recursive copies into a brand-new destination (zero partial-merge risk)
+    if [ "$recursive" -eq 1 ] && [ "$unsupported" -eq 0 ] && [ "$arg_count" -eq 2 ] && [ -n "$last_arg" ] && [ ! -e "$last_arg" ] && [ ! -L "$last_arg" ]; then
+        if /bin/cp -c "$@" 2>/dev/null; then
+            exit 0
+        fi
+    fi
+    exec /bin/cp "$@"
+    """
+
 
     private func generateSandboxZshrc(for sandbox: MacSandboxSession, config cfg: BooBoxConfig) -> String {
         let shortID = sandbox.shortID
@@ -1626,24 +1690,20 @@ final class MacOSSandboxManager: @unchecked Sendable {
             source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
         fi
 
+        _boobox_ws='\(wsPath)'
         _boobox_precmd() {
             printf '\\e]7;file://boobox%s\\a' "$PWD"
+            if [ "$PWD" = "$_boobox_ws" ]; then
+                psvar[1]="workspace"
+            elif [[ "$PWD" == "$_boobox_ws/"* ]]; then
+                psvar[1]="workspace/${PWD#$_boobox_ws/}"
+            else
+                psvar[1]="${PWD/#$HOME/~}"
+            fi
         }
         autoload -Uz add-zsh-hook
         add-zsh-hook precmd _boobox_precmd
-
-        _boobox_prompt_dir() {
-            local ws='\(wsPath)'
-            if [ "$PWD" = "$ws" ]; then
-                echo "workspace"
-            elif [[ "$PWD" == "$ws/"* ]]; then
-                echo "workspace/${PWD#$ws/}"
-            else
-                echo "${PWD/#$HOME/~}"
-            fi
-        }
-        setopt PROMPT_SUBST
-        PROMPT='%F{cyan}boo_box%f %F{blue}$(_boobox_prompt_dir)%f %# '
+        PROMPT='%F{cyan}boo_box%f %F{blue}%1v%f %# '
         HISTFILE="$HOME/.zsh_history"
         HISTSIZE=5000
         SAVEHIST=5000
