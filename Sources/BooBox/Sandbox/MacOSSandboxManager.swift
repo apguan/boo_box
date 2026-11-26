@@ -5,11 +5,13 @@ import Foundation
 enum MacSandboxError: LocalizedError {
     case invalidProjectDirectory(String)
     case cloneFailed(String)
+    case cancelled
 
     var errorDescription: String? {
         switch self {
         case .invalidProjectDirectory(let reason): reason
         case .cloneFailed(let reason): "Failed to clone project into sandbox: \(reason)"
+        case .cancelled: "Cloning cancelled."
         }
     }
 }
@@ -22,6 +24,7 @@ struct MacSandboxMetadata: Codable, Sendable {
     var hasUserCustomName: Bool
     var sourceProjectPath: String?
     var overrides: SandboxOverrideConfig
+    var isOverlay: Bool
 
     init(
         id: UUID,
@@ -30,7 +33,8 @@ struct MacSandboxMetadata: Codable, Sendable {
         createdAt: Date,
         hasUserCustomName: Bool = false,
         sourceProjectPath: String? = nil,
-        overrides: SandboxOverrideConfig = .default
+        overrides: SandboxOverrideConfig = .default,
+        isOverlay: Bool = false
     ) {
         self.id = id
         self.shortID = shortID
@@ -39,6 +43,7 @@ struct MacSandboxMetadata: Codable, Sendable {
         self.hasUserCustomName = hasUserCustomName
         self.sourceProjectPath = sourceProjectPath
         self.overrides = overrides
+        self.isOverlay = isOverlay
     }
 
     init(from decoder: Decoder) throws {
@@ -50,6 +55,7 @@ struct MacSandboxMetadata: Codable, Sendable {
         self.hasUserCustomName = try c.decodeIfPresent(Bool.self, forKey: .hasUserCustomName) ?? false
         self.sourceProjectPath = try c.decodeIfPresent(String.self, forKey: .sourceProjectPath)
         self.overrides = try c.decodeIfPresent(SandboxOverrideConfig.self, forKey: .overrides) ?? .default
+        self.isOverlay = try c.decodeIfPresent(Bool.self, forKey: .isOverlay) ?? false
     }
 }
 
@@ -61,12 +67,25 @@ struct MacSandboxSession: Identifiable, Sendable {
     var hasUserCustomName: Bool
     let sourceProjectPath: String?
     var overrides: SandboxOverrideConfig
+    let isOverlay: Bool
     let sessionDir: URL
     let workspaceDir: URL
     let homeDir: URL
     let tmpDir: URL
     let profileURL: URL
     let metadataURL: URL
+
+    var overlayDir: URL {
+        sessionDir.appendingPathComponent(".overlay", isDirectory: true)
+    }
+
+    var overlayUpperDir: URL {
+        overlayDir.appendingPathComponent("upper", isDirectory: true)
+    }
+
+    var overlayWhiteoutURL: URL {
+        overlayDir.appendingPathComponent("whiteouts.json")
+    }
 
     var shortDisplayPath: String {
         "~/boo_box/sessions/\(shortID)/workspace"
@@ -127,16 +146,97 @@ final class MacOSSandboxManager: @unchecked Sendable {
         return resolved
     }
 
+    private let activeCloneLock = NSLock()
+    private var activeCloneProcess: Process?
+    private var activeCloneSessionDir: URL?
+    private var activeCloneCancelled = false
+
+    /// Immediately cancels an in-flight GUI project clone and reaps its partial session directory in the background.
+    func cancelActiveClone() {
+        activeCloneLock.lock()
+        activeCloneCancelled = true
+        let proc = activeCloneProcess
+        let dir = activeCloneSessionDir
+        activeCloneProcess = nil
+        activeCloneSessionDir = nil
+        activeCloneLock.unlock()
+
+        if let proc, proc.isRunning {
+            proc.terminate()
+        }
+        if let dir {
+            reapDirectoryAsync(dir, afterProcess: proc)
+        }
+    }
+
+    private func reapDirectoryAsync(_ dir: URL, afterProcess proc: Process? = nil) {
+        let root = sessionsRootURL
+        let trashName = ".trash-cancel-\(UUID().uuidString.prefix(8))"
+        let trashURL = root.appendingPathComponent(trashName, isDirectory: true)
+        DispatchQueue.global(qos: .background).async {
+            if let proc, proc.isRunning {
+                proc.waitUntilExit()
+            }
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: dir.path) else { return }
+            if (try? fm.moveItem(at: dir, to: trashURL)) != nil {
+                let rm = Process()
+                rm.executableURL = URL(fileURLWithPath: "/bin/rm")
+                rm.arguments = ["-rf", trashURL.path]
+                try? rm.run()
+            } else {
+                try? fm.removeItem(at: dir)
+            }
+        }
+    }
+
     func createSession(
         id: UUID = UUID(),
         name: String,
         hasUserCustomName: Bool = false,
         sourceProjectURL: URL? = nil,
-        excludeEnvFilesOverride: Bool? = nil
+        excludeEnvFilesOverride: Bool? = nil,
+        forceAPFSClone: Bool = false
     ) throws -> MacSandboxSession {
         let shortID = "s-\(id.uuidString.prefix(8).lowercased())"
         let sessionDir = sessionsRootURL.appendingPathComponent(shortID, isDirectory: true).resolvingSymlinksInPath()
         let validatedSource = try sourceProjectURL.map { try validateProjectDirectory($0) }
+        let cfg = BooBoxConfigManager.currentSnapshot().general
+        let excludeEnv = excludeEnvFilesOverride ?? cfg.excludeEnvFilesWhenCloning
+        let useOverlay = (validatedSource != nil) && !forceAPFSClone && (cfg.workspaceMode == .overlay)
+
+        if let src = validatedSource, useOverlay {
+            let overlayDir = sessionDir.appendingPathComponent(".overlay", isDirectory: true)
+            let upperDir = overlayDir.appendingPathComponent("upper", isDirectory: true)
+            let whiteoutFile = overlayDir.appendingPathComponent("whiteouts.json")
+            let workspaceDir = sessionDir.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: upperDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            do {
+                try OverlayClient.shared.mount(
+                    sessionID: shortID,
+                    lowerDir: src.path,
+                    upperDir: upperDir.path,
+                    whiteoutFile: whiteoutFile.path,
+                    mountPoint: workspaceDir.path,
+                    excludeEnv: excludeEnv
+                )
+            } catch {
+                reapDirectoryAsync(sessionDir)
+                throw error
+            }
+            return try materializeSession(
+                id: id,
+                shortID: shortID,
+                name: name,
+                createdAt: Date(),
+                hasUserCustomName: hasUserCustomName,
+                sourceProjectPath: src.path,
+                sessionDir: sessionDir,
+                isOverlay: true
+            )
+        }
+
         let sandbox = try materializeSession(
             id: id,
             shortID: shortID,
@@ -144,21 +244,37 @@ final class MacOSSandboxManager: @unchecked Sendable {
             createdAt: Date(),
             hasUserCustomName: hasUserCustomName,
             sourceProjectPath: validatedSource?.path,
-            sessionDir: sessionDir
+            sessionDir: sessionDir,
+            isOverlay: false
         )
         if let src = validatedSource {
-            let cfg = BooBoxConfigManager.currentSnapshot().general
-            let excludeEnv = excludeEnvFilesOverride ?? cfg.excludeEnvFilesWhenCloning
+            activeCloneLock.lock()
+            activeCloneCancelled = false
+            activeCloneSessionDir = sessionDir
+            activeCloneLock.unlock()
+            defer {
+                activeCloneLock.lock()
+                activeCloneProcess = nil
+                activeCloneSessionDir = nil
+                activeCloneLock.unlock()
+            }
             do {
                 try cloneProjectDirectory(
                     from: src,
                     to: sandbox.workspaceDir,
                     excludeEnvFiles: excludeEnv,
-                    skipHeavyDirs: cfg.skipHeavyDirsWhenCloning
+                    skipHeavyDirs: cfg.skipHeavyDirsWhenCloning,
+                    trackAsActiveClone: true
                 )
+                activeCloneLock.lock()
+                let wasCancelled = activeCloneCancelled
+                activeCloneLock.unlock()
+                if wasCancelled {
+                    throw MacSandboxError.cancelled
+                }
                 applyQuarantineAttribute(to: sandbox.workspaceDir.path)
             } catch {
-                try? FileManager.default.removeItem(at: sessionDir)
+                reapDirectoryAsync(sessionDir)
                 throw error
             }
         }
@@ -480,7 +596,19 @@ final class MacOSSandboxManager: @unchecked Sendable {
     }
 
     func prepareForResume(_ sandbox: MacSandboxSession) throws -> MacSandboxSession {
-        try materializeSession(
+        if sandbox.isOverlay, let srcPath = sandbox.sourceProjectPath,
+           !OverlayClient.isPathNFSMounted(sandbox.workspaceDir.path) {
+            let cfg = BooBoxConfigManager.currentSnapshot().general
+            try OverlayClient.shared.mount(
+                sessionID: sandbox.shortID,
+                lowerDir: srcPath,
+                upperDir: sandbox.overlayUpperDir.path,
+                whiteoutFile: sandbox.overlayWhiteoutURL.path,
+                mountPoint: sandbox.workspaceDir.path,
+                excludeEnv: cfg.excludeEnvFilesWhenCloning
+            )
+        }
+        return try materializeSession(
             id: sandbox.id,
             shortID: sandbox.shortID,
             name: sandbox.name,
@@ -488,7 +616,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: sandbox.hasUserCustomName,
             sourceProjectPath: sandbox.sourceProjectPath,
             sessionDir: sandbox.sessionDir,
-            overrides: sandbox.overrides
+            overrides: sandbox.overrides,
+            isOverlay: sandbox.isOverlay
         )
     }
 
@@ -501,7 +630,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: sandbox.hasUserCustomName,
             sourceProjectPath: sandbox.sourceProjectPath,
             sessionDir: sandbox.sessionDir,
-            overrides: overrides
+            overrides: overrides,
+            isOverlay: sandbox.isOverlay
         )
         SecretsVaultManager.shared.updateSessionPolicy(for: sandbox.shortID, overrides: overrides)
         return updated
@@ -515,7 +645,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             createdAt: sandbox.createdAt,
             hasUserCustomName: isUserCustom,
             sourceProjectPath: sandbox.sourceProjectPath,
-            overrides: sandbox.overrides
+            overrides: sandbox.overrides,
+            isOverlay: sandbox.isOverlay
         )
         writeMetadata(meta, to: sandbox.metadataURL)
     }
@@ -536,7 +667,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
         from sourceDir: URL,
         to destDir: URL,
         excludeEnvFiles: Bool,
-        skipHeavyDirs: Bool
+        skipHeavyDirs: Bool,
+        trackAsActiveClone: Bool = false
     ) throws {
         // Prefer compiled multi-threaded native `boobox-clone` helper (~2s on 70k-file monorepos)
         if let helperURL = resolveCloneHelperURL() {
@@ -548,8 +680,26 @@ final class MacOSSandboxManager: @unchecked Sendable {
             proc.arguments = helperArgs
             let errPipe = Pipe()
             proc.standardError = errPipe
+            if trackAsActiveClone {
+                activeCloneLock.lock()
+                if activeCloneCancelled {
+                    activeCloneLock.unlock()
+                    throw MacSandboxError.cancelled
+                }
+                activeCloneProcess = proc
+                activeCloneLock.unlock()
+            }
             try proc.run()
             proc.waitUntilExit()
+            if trackAsActiveClone {
+                activeCloneLock.lock()
+                let wasCancelled = activeCloneCancelled
+                if activeCloneProcess === proc { activeCloneProcess = nil }
+                activeCloneLock.unlock()
+                if wasCancelled {
+                    throw MacSandboxError.cancelled
+                }
+            }
             if proc.terminationStatus == 0 {
                 return
             }
@@ -557,7 +707,6 @@ final class MacOSSandboxManager: @unchecked Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? "exit \(proc.terminationStatus)"
             throw MacSandboxError.cloneFailed(errText)
         }
-
         let fm = FileManager.default
         if !excludeEnvFiles && !skipHeavyDirs {
             _ = try? fm.removeItem(at: destDir)
@@ -922,15 +1071,28 @@ final class MacOSSandboxManager: @unchecked Sendable {
     }
     func workspaceFileCount(for sandbox: MacSandboxSession) -> Int {
         let fm = FileManager.default
+        if sandbox.isOverlay {
+            if let upperItems = try? fm.contentsOfDirectory(atPath: sandbox.overlayUpperDir.path),
+               !upperItems.filter({ $0 != ".DS_Store" }).isEmpty {
+                return upperItems.count
+            }
+            if let src = sandbox.sourceProjectPath, fm.fileExists(atPath: src) {
+                return 1
+            }
+            return 0
+        }
         guard let items = try? fm.contentsOfDirectory(atPath: sandbox.workspaceDir.path) else {
             return 0
         }
         return items.filter { $0 != ".DS_Store" }.count
     }
 
-    /// Instant (<0.2 ms) non-blocking deletion: atomically renames the session dir to a hidden
-    /// `.trash-*` path so the UI updates immediately with zero hang, then deletes it asynchronously.
+    /// Instant (<0.2 ms) non-blocking deletion: unmounts any CoW overlay first, atomically renames the
+    /// session dir to a hidden `.trash-*` path so the UI updates immediately, then deletes asynchronously.
     func deleteSessionDir(_ sandbox: MacSandboxSession) {
+        if sandbox.isOverlay || OverlayClient.isPathNFSMounted(sandbox.workspaceDir.path) {
+            OverlayClient.shared.unmount(sessionID: sandbox.shortID, mountPoint: sandbox.workspaceDir.path)
+        }
         let srcPath = sandbox.sessionDir.path
         let trashName = ".trash-\(sandbox.shortID)-\(UUID().uuidString.prefix(8))"
         let trashURL = sessionsRootURL.appendingPathComponent(trashName, isDirectory: true)
@@ -966,6 +1128,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: meta.hasUserCustomName,
             sourceProjectPath: meta.sourceProjectPath,
             overrides: meta.overrides,
+            isOverlay: meta.isOverlay,
             sessionDir: dir,
             workspaceDir: wsURL,
             homeDir: dir.appendingPathComponent(".home", isDirectory: true),
@@ -1008,6 +1171,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
                 hasUserCustomName: meta.hasUserCustomName,
                 sourceProjectPath: meta.sourceProjectPath,
                 overrides: meta.overrides,
+                isOverlay: meta.isOverlay,
                 sessionDir: resolvedDir,
                 workspaceDir: wsURL,
                 homeDir: resolvedDir.appendingPathComponent(".home", isDirectory: true),
@@ -1208,7 +1372,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
         hasUserCustomName: Bool,
         sourceProjectPath: String?,
         sessionDir: URL,
-        overrides: SandboxOverrideConfig = .default
+        overrides: SandboxOverrideConfig = .default,
+        isOverlay: Bool = false
     ) throws -> MacSandboxSession {
         let fm = FileManager.default
         let cfg = BooBoxConfigManager.currentSnapshot().applying(overrides: overrides)
@@ -1238,8 +1403,10 @@ final class MacOSSandboxManager: @unchecked Sendable {
             }
         }
 
-        // Tag workspace with macOS quarantine attribute to block silent Finder app execution
-        applyQuarantineAttribute(to: workspaceDir.path)
+        // Tag workspace with macOS quarantine attribute to block silent Finder app execution (skip on NFS mount)
+        if !isOverlay {
+            applyQuarantineAttribute(to: workspaceDir.path)
+        }
 
         let sandbox = MacSandboxSession(
             id: id,
@@ -1249,6 +1416,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: hasUserCustomName,
             sourceProjectPath: sourceProjectPath,
             overrides: overrides,
+            isOverlay: isOverlay,
             sessionDir: sessionDir,
             workspaceDir: workspaceDir,
             homeDir: homeDir,
@@ -1304,7 +1472,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             createdAt: createdAt,
             hasUserCustomName: hasUserCustomName,
             sourceProjectPath: sourceProjectPath,
-            overrides: overrides
+            overrides: overrides,
+            isOverlay: isOverlay
         )
         writeMetadata(meta, to: metadataURL)
         return sandbox
@@ -1558,6 +1727,14 @@ final class MacOSSandboxManager: @unchecked Sendable {
             return ""
         }()
 
+        let overlayPortBlock: String = {
+            let overlayPort = OverlayClient.shared.currentPort
+            guard overlayPort > 0 else { return "" }
+            return """
+            ;; 5. Block direct sandbox TCP access to host boobox-overlay daemon (only macOS kernel NFS client connects)
+            (deny network-outbound (remote tcp "localhost:\(overlayPort)"))
+            """
+        }()
         return """
         (version 1)
         (allow default)
@@ -1643,6 +1820,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             (literal "\(profilePath)")
             (literal "\(metadataPath)")
             (literal "\(sessionPath)/.clone-meta.json")
+            (subpath "\(sessionPath)/.overlay")
             (subpath "\(realHome)/boo_box/vault")
         )
         (deny file-write*
@@ -1651,9 +1829,11 @@ final class MacOSSandboxManager: @unchecked Sendable {
             (literal "\(sessionPath)/.clone-meta.json")
             (literal "\(zshenvPath)")
             (subpath "\(sessionPath)/.home/.boobox-bin")
+            (subpath "\(sessionPath)/.overlay")
             (subpath "\(realHome)/boo_box/vault")
         )
         \(networkPolicyBlock)
+        \(overlayPortBlock)
         """
     }
 

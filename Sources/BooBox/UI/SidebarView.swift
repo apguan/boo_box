@@ -153,6 +153,13 @@ struct SidebarView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer()
+            Button("Cancel") {
+                store.cancelActiveProjectClone()
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(.secondary)
+            .help("Cancel cloning and clean up partial session")
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 8)

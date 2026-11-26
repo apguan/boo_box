@@ -283,20 +283,45 @@ private struct GeneralSettingsTab: View {
                     }
                 }
 
-                SettingsCard(title: "Project Cloning (boo <dir>)") {
-                    SettingsToggleRow(
-                        title: "Exclude .env* files when cloning project folders",
-                        subtitle: "Off by default so local dev servers work immediately. Turn on (or run `boo --no-env .`) to skip `.env` / `.env.local` while keeping `.env.example`.",
-                        isOn: $configManager.config.general.excludeEnvFilesWhenCloning
-                    )
+                SettingsCard(title: "Project Workspaces (boo <dir>)") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Workspace isolation engine")
+                                    .font(.system(size: 12.5, weight: .medium))
+                                Text("Instant CoW Overlay mounts any size folder (even multi-million-file monorepos or entire partitions) in ~20 ms via read-only host lower layer + isolated upper layer. APFS Full Clone creates a frozen point-in-time copy.")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 12)
+                            Picker("", selection: $configManager.config.general.workspaceMode) {
+                                ForEach(WorkspaceIsolationMode.allCases) { mode in
+                                    Text(mode.label).tag(mode)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(width: 245)
+                        }
+                    }
 
                     Divider()
 
                     SettingsToggleRow(
-                        title: "Slim clone (skip node_modules & build caches)",
-                        subtitle: "Off by default — APFS copy-on-write clones all files (including node_modules & dotfiles) with zero extra SSD bytes, and the warm pool makes repeat opens ~1s. Enable only if you prefer smaller cold clones.",
-                        isOn: $configManager.config.general.skipHeavyDirsWhenCloning
+                        title: "Exclude .env* files from host folder",
+                        subtitle: "Off by default so local dev servers work immediately. Turn on (or run `boo --no-env .`) to hide host `.env` / `.env.local` while keeping `.env.example` (you can still create sandbox-local `.env` files).",
+                        isOn: $configManager.config.general.excludeEnvFilesWhenCloning
                     )
+
+                    if configManager.config.general.workspaceMode == .apfsClone {
+                        Divider()
+
+                        SettingsToggleRow(
+                            title: "Slim APFS clone (skip node_modules & build caches)",
+                            subtitle: "Only applies in APFS Full Clone mode. Skips heavy ignored dirs for faster cold clones.",
+                            isOn: $configManager.config.general.skipHeavyDirsWhenCloning
+                        )
+                    }
                 }
 
                 SettingsCard(title: "Configuration File") {

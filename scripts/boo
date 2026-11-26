@@ -6,12 +6,13 @@ usage() {
 boo — boo_box CLI for isolated APFS sandboxes and the shared global sandbox env
 
 Sandbox Sessions:
-  boo                         Clone current directory into a sandbox (or scratch if in ~ / /)
-  boo .                       Clone current directory (all files incl. node_modules, 0 extra SSD bytes)
-  boo <dir>                   Clone <dir> into an isolated APFS sandbox session
-  boo --no-env [dir]          Exclude .env / .env.* secret files when cloning
-  boo --slim [dir]            Skip node_modules & gitignored build caches for faster cold clone
-  boo --full [dir]            Clone all files including node_modules & build caches (default)
+  boo                         Open current directory in a sandbox (or activate if in ~ / /)
+  boo .                       Open current directory (~20 ms CoW overlay by default)
+  boo <dir>                   Open <dir> in an isolated sandbox session
+  boo --no-env [dir]          Hide host .env / .env.* secret files (keeps .env.example)
+  boo --overlay [dir]         Force instant O(1) ~20 ms CoW overlay mount (default)
+  boo --clone / --full [dir]  Force frozen APFS full clone (including node_modules)
+  boo --slim [dir]            Force frozen APFS slim clone (skip node_modules & caches)
   boo --scratch               Open a fresh empty scratch sandbox session
 
 Global Sandbox Environment (~/boo_box/env — shared across all sessions):
@@ -97,7 +98,7 @@ case "${1:-}" in
         ;;
 esac
 NO_ENV=0
-CLONE_MODE=""   # "" = follow config.json (default full), "full", or "slim"
+CLONE_MODE=""   # "" = follow config.json (default overlay), "overlay", "full", or "slim"
 SCRATCH=0
 TARGET=""
 
@@ -111,7 +112,11 @@ while [ $# -gt 0 ]; do
             NO_ENV=1
             shift
             ;;
-        --full)
+        --overlay)
+            CLONE_MODE="overlay"
+            shift
+            ;;
+        --clone|--full)
             CLONE_MODE="full"
             shift
             ;;
@@ -175,7 +180,33 @@ fi
 ABS_DIR="$(cd "$TARGET" && pwd -P)"
 PROJ_NAME="$(basename "$ABS_DIR")"
 
-# Pop from warm APFS pool + Git/lockfile delta-sync (zero python3, <1 ms Unix socket handoff to running boo_box)
+# Determine effective workspace mode: default "overlay" (~20 ms O(1)) unless user opted into APFS clone
+USE_OVERLAY=1
+if [ "$CLONE_MODE" = "full" ] || [ "$CLONE_MODE" = "slim" ]; then
+    USE_OVERLAY=0
+elif [ "$CLONE_MODE" != "overlay" ] && [ -f "$HOME/boo_box/config.json" ]; then
+    if grep -q '"workspaceMode"[[:space:]]*:[[:space:]]*"apfsClone"' "$HOME/boo_box/config.json" 2>/dev/null; then
+        USE_OVERLAY=0
+    fi
+fi
+
+if [ "$USE_OVERLAY" -eq 1 ]; then
+    ESC_DIR="${ABS_DIR//\\/\\\\}"; ESC_DIR="${ESC_DIR//\"/\\\"}"
+    ESC_NAME="${PROJ_NAME//\\/\\\\}"; ESC_NAME="${ESC_NAME//\"/\\\"}"
+    NO_ENV_JSON="false"; [ "$NO_ENV" -eq 1 ] && NO_ENV_JSON="true"
+    PAYLOAD="{\"op\":\"open\",\"path\":\"$ESC_DIR\",\"name\":\"$ESC_NAME\",\"noEnv\":$NO_ENV_JSON}"
+    if [ -S "$SOCK_PATH" ] && "$CLONE_BIN" --ipc-send "$SOCK_PATH" "$PAYLOAD" 2>/dev/null; then
+        exit 0
+    fi
+    if [ "$NO_ENV" -eq 1 ]; then
+        open -a "$APP_PATH" --args --dir "$ABS_DIR" --name "$PROJ_NAME" --no-env
+    else
+        open -a "$APP_PATH" --args --dir "$ABS_DIR" --name "$PROJ_NAME"
+    fi
+    exit 0
+fi
+
+# APFS Clone mode: pop from warm pool + Git/lockfile delta-sync (<1 ms Unix socket handoff)
 SESS_UUID="$(/usr/bin/uuidgen)"
 SHORT_ID="s-$(printf '%s' "${SESS_UUID:0:8}" | tr '[:upper:]' '[:lower:]')"
 SESS_DIR="$HOME/boo_box/sessions/$SHORT_ID"
@@ -209,8 +240,39 @@ if [ ! -d "$WARM_DIR" ] || [ ! -f "$WARM_META" ]; then
     printf 'boo_box: cloning %s into %s (zero-copy APFS; future runs pop warm pool)...\n' "$PROJ_NAME" "$SHORT_ID"
 fi
 
+CLONE_PID=""
+cleanup_cancelled_clone() {
+    trap - INT TERM
+    printf '\nboo_box: cancelled — cleaning up partial clone in background...\n' >&2
+    if [ -n "$CLONE_PID" ]; then
+        kill -TERM "$CLONE_PID" 2>/dev/null || true
+    fi
+    # Detach reaping so your terminal prompt returns immediately even if macOS XNU is mid-clonefile(2)
+    TRASH_DST="$HOME/boo_box/.trash-cancel-${SHORT_ID}-$$"
+    nohup /bin/sh -c '
+        pid="$1"; src="$2"; dst="$3"
+        if [ -n "$pid" ]; then
+            i=0
+            while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 150 ]; do
+                sleep 0.2
+                i=$((i + 1))
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        if [ -d "$src" ]; then
+            mv "$src" "$dst" 2>/dev/null && /bin/rm -rf "$dst" 2>/dev/null || /bin/rm -rf "$src" 2>/dev/null || true
+        fi
+    ' _ "$CLONE_PID" "$SESS_DIR" "$TRASH_DST" >/dev/null 2>&1 </dev/null &
+    exit 130
+}
+trap cleanup_cancelled_clone INT TERM
+
 RC=0
-"$CLONE_BIN" "${CLONE_ARGS[@]}" || RC=$?
+"$CLONE_BIN" "${CLONE_ARGS[@]}" &
+CLONE_PID=$!
+wait "$CLONE_PID" || RC=$?
+trap - INT TERM
+
 if [ "$RC" -eq 0 ]; then
     exit 0
 elif [ "$RC" -eq 10 ]; then
@@ -222,6 +284,9 @@ elif [ "$RC" -eq 10 ]; then
     fi
     exit 0
 else
-    rm -rf "$SESS_DIR"
+    if [ -d "$SESS_DIR" ]; then
+        TRASH_DST="$HOME/boo_box/.trash-fail-${SHORT_ID}-$$"
+        mv "$SESS_DIR" "$TRASH_DST" 2>/dev/null && nohup /bin/rm -rf "$TRASH_DST" >/dev/null 2>&1 </dev/null &
+    fi
     exit "$RC"
 fi

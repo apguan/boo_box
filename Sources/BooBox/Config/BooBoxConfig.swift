@@ -138,15 +138,32 @@ struct AppearanceConfig: Codable, Equatable, Sendable {
     var backgroundOpacity: Double = 1.0
 }
 
+enum WorkspaceIsolationMode: String, Codable, CaseIterable, Sendable, Identifiable {
+    /// O(1) ~20 ms localhost NFSv3 Copy-on-Write overlay (handles multi-million-file repos & folders instantly).
+    case overlay = "overlay"
+    /// Eager APFS clonefile(2) snapshot (frozen point-in-time copy with raw native APFS syscall speed).
+    case apfsClone = "apfsClone"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .overlay: "Instant CoW Overlay (~20 ms, O(1))"
+        case .apfsClone: "APFS Full Clone (frozen snapshot)"
+        }
+    }
+}
+
 struct GeneralConfig: Codable, Equatable, Sendable {
+    /// How project folders are materialized into sandboxes (`overlay` = ~20 ms O(1) CoW; `apfsClone` = frozen APFS copy).
+    var workspaceMode: WorkspaceIsolationMode = .overlay
     /// Prompt with a warning alert before permanently deleting a session directory.
     var confirmBeforeDeletingSession: Bool = true
     /// Automatically name sessions from repo, Git branch, sub-package, or agent title until manually renamed.
     var autoNameSessions: Bool = true
-    /// Exclude `.env` / `.env.*` files (except `.env.example`/`.sample`/`.template`) when cloning a project folder.
+    /// Exclude `.env` / `.env.*` files (except `.env.example`/`.sample`/`.template`) when opening a project folder.
     var excludeEnvFilesWhenCloning: Bool = false
-    /// Optional slim clone: skip `node_modules`, `.next`, `.turbo`, `.venv`, `target`, `.build`.
-    /// Off by default so APFS zero-copy cloning brings over 100% of files (zero `npm/bun install` needed).
+    /// Optional slim clone (APFS Clone mode): skip `node_modules`, `.next`, `.turbo`, `.venv`, `target`, `.build`.
     var skipHeavyDirsWhenCloning: Bool = false
     /// Show a dismissible confirmation alert before opening http(s) websites clicked inside sandboxed terminals.
     /// Non-http(s) URL schemes (e.g. file://, custom app links) always ask in sandboxed tabs.
@@ -163,6 +180,7 @@ struct GeneralConfig: Codable, Equatable, Sendable {
     var persistentSessionsEnabled: Bool = true
 
     init(
+        workspaceMode: WorkspaceIsolationMode = .overlay,
         confirmBeforeDeletingSession: Bool = true,
         autoNameSessions: Bool = true,
         excludeEnvFilesWhenCloning: Bool = false,
@@ -174,6 +192,7 @@ struct GeneralConfig: Codable, Equatable, Sendable {
         restoreSessionsOnLaunch: Bool = true,
         persistentSessionsEnabled: Bool = true
     ) {
+        self.workspaceMode = workspaceMode
         self.confirmBeforeDeletingSession = confirmBeforeDeletingSession
         self.autoNameSessions = autoNameSessions
         self.excludeEnvFilesWhenCloning = excludeEnvFilesWhenCloning
@@ -188,6 +207,7 @@ struct GeneralConfig: Codable, Equatable, Sendable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.workspaceMode = try c.decodeIfPresent(WorkspaceIsolationMode.self, forKey: .workspaceMode) ?? .overlay
         self.confirmBeforeDeletingSession = try c.decodeIfPresent(Bool.self, forKey: .confirmBeforeDeletingSession) ?? true
         self.autoNameSessions = try c.decodeIfPresent(Bool.self, forKey: .autoNameSessions) ?? true
         self.excludeEnvFilesWhenCloning = try c.decodeIfPresent(Bool.self, forKey: .excludeEnvFilesWhenCloning) ?? false

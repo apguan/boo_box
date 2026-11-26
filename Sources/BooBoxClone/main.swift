@@ -47,6 +47,12 @@ final class ResultBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
+nonisolated(unsafe) private var cloneCancelled: sig_atomic_t = 0
+private func handleCloneCancelSignal(_: Int32) {
+    cloneCancelled = 1
+}
+signal(SIGINT, handleCloneCancelSignal)
+signal(SIGTERM, handleCloneCancelSignal)
 private func isSecretEnvFile(_ filename: String) -> Bool {
     let lower = filename.lowercased()
     return (lower == ".env" || lower.hasPrefix(".env.")) && !envTemplateAllowlist.contains(lower)
@@ -1117,8 +1123,12 @@ if includeIgnored {
     let immutableDst = dstDir
     let immutableExcludeEnv = excludeEnv
     DispatchQueue.concurrentPerform(iterations: topEntries.count) { idx in
+        if cloneCancelled != 0 { return }
         let name = topEntries[idx].name
         cloneSubtreeAPFS(src: immutableSrc + "/" + name, dst: immutableDst + "/" + name, excludeEnv: immutableExcludeEnv)
+    }
+    if cloneCancelled != 0 {
+        exit(130)
     }
     if shouldCaptureMeta, let writeMetaPath {
         metaGroup.wait()
@@ -1179,6 +1189,7 @@ if includeIgnored {
     let immutableDst = dstDir
 
     DispatchQueue.concurrentPerform(iterations: totalTasks) { taskIdx in
+        if cloneCancelled != 0 { return }
         if hasGitDir && taskIdx == workerCount {
             cloneSinglePath(src: immutableSrc + "/.git", dst: immutableDst + "/.git")
             return
@@ -1187,11 +1198,14 @@ if includeIgnored {
         let end = min(start + chunkSize, immutableFiles.count)
         guard start < end else { return }
         for i in start..<end {
+            if cloneCancelled != 0 { return }
             let rel = immutableFiles[i]
             cloneSinglePath(src: immutableSrc + "/" + rel, dst: immutableDst + "/" + rel)
         }
     }
-
+    if cloneCancelled != 0 {
+        exit(130)
+    }
     if shouldCaptureMeta, let writeMetaPath {
         metaGroup.wait()
         if let dirty = capturedDirtyBox.value {

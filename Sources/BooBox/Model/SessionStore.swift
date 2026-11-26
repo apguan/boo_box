@@ -648,6 +648,11 @@ final class SessionStore: ObservableObject {
         }
     }
 
+    func cancelActiveProjectClone() {
+        cloningProjectName = nil
+        MacOSSandboxManager.shared.cancelActiveClone()
+    }
+
 
     /// Immediately adopts a session already APFS-cloned by `boo` CLI (0ms extra wait!)
     /// and stages a clean background template snapshot so future `⌘T` presses clone fresh copies.
@@ -758,7 +763,7 @@ final class SessionStore: ObservableObject {
                 switch result {
                 case .success(let sandbox):
                     _ = self.startSessionWithMacSandbox(sandbox, sequenceNumber: seq)
-                    if let templateURL = self.activeProjectTemplateURL {
+                    if !sandbox.isOverlay, let templateURL = self.activeProjectTemplateURL {
                         let cfg = BooBoxConfigManager.shared.config.general
                         MacOSSandboxManager.shared.replenishWarmCloneInBackground(
                             for: templateURL,
@@ -766,13 +771,14 @@ final class SessionStore: ObservableObject {
                             skipHeavyDirs: cfg.skipHeavyDirsWhenCloning
                         )
                     }
+                case .failure(MacSandboxError.cancelled):
+                    break
                 case .failure(let error):
                     self.presentProjectError(error)
                 }
             }
         }
     }
-
     private func presentProjectError(_ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -1156,6 +1162,11 @@ final class SessionStore: ObservableObject {
             // Keep persisted session directory if files were saved in workspace/; auto-delete if empty.
             if MacOSSandboxManager.shared.workspaceFileCount(for: sb) == 0 {
                 MacOSSandboxManager.shared.deleteSessionDir(sb)
+            } else if sb.isOverlay {
+                // Unmount CoW overlay cleanly while preserving .overlay/upper + whiteouts for instant PAST resume
+                DispatchQueue.global(qos: .utility).async {
+                    OverlayClient.shared.unmount(sessionID: sb.shortID, mountPoint: sb.workspaceDir.path)
+                }
             }
         }
         stageView.removeSession(id)
