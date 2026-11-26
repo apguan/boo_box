@@ -3,6 +3,7 @@ import SwiftUI
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
+    case connections = "Connections"
     case secretsNetwork = "Secrets & Network"
     case privateVM = "Private VM"
     case globalEnv = "Global Env"
@@ -16,6 +17,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .general: "gearshape"
+        case .connections: "link.circle.fill"
         case .secretsNetwork: "key.fill"
         case .privateVM: "cpu"
         case .globalEnv: "cube.box"
@@ -116,6 +118,8 @@ struct SettingsView: View {
                 switch nav.selectedTab {
                 case .general:
                     GeneralSettingsTab(configManager: configManager)
+                case .connections:
+                    ConnectionsSettingsTab(configManager: configManager)
                 case .secretsNetwork:
                     SecretsNetworkSettingsTab(configManager: configManager)
                 case .privateVM:
@@ -2369,7 +2373,7 @@ private struct ThemePreviewCard: View {
 
 // MARK: - Shared UI Helpers
 
-private struct SettingsHeader: View {
+struct SettingsHeader: View {
     let title: String
     let subtitle: String
 
@@ -2384,7 +2388,7 @@ private struct SettingsHeader: View {
     }
 }
 
-private struct SettingsToggleRow: View {
+struct SettingsToggleRow: View {
     let title: String
     let subtitle: String
     @Binding var isOn: Bool
@@ -2408,7 +2412,7 @@ private struct SettingsToggleRow: View {
     }
 }
 
-private struct SettingsCard<Content: View>: View {
+struct SettingsCard<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
 

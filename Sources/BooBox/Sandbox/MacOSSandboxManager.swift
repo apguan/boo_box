@@ -1268,11 +1268,23 @@ final class MacOSSandboxManager: @unchecked Sendable {
         let sbpl = generateSBPLProfile(for: sandbox, config: cfg)
         try sbpl.write(to: profileURL, atomically: true, encoding: .utf8)
 
-        // Write 0600 env export file sourced by .zshrc (keeps secret values off process argv / `ps`)
+        // Write 0600 env export file sourced by .zshrc (keeps secret values off process argv / `ps`).
+        // Merges Keychain-backed Connection tokens first, then explicit Ephemeral/Per-Sandbox overrides.
         let envFileURL = homeDir.appendingPathComponent(".boobox-env.sh")
-        let envEntries = cfg.ephemeralSetup.injectEnvIntoMacSandbox ? cfg.ephemeralSetup.cleanedEnvVars : []
-        if !envEntries.isEmpty {
-            let lines = envEntries.map { pair in
+        var mergedEnv: [(key: String, value: String)] = ConnectionsManager.shared.resolvedSandboxEnvEntries(
+            config: cfg,
+            overrides: sandbox.overrides
+        )
+        let explicitEntries = cfg.ephemeralSetup.injectEnvIntoMacSandbox ? cfg.ephemeralSetup.cleanedEnvVars : []
+        for entry in explicitEntries {
+            if let idx = mergedEnv.firstIndex(where: { $0.key == entry.key }) {
+                mergedEnv[idx] = entry
+            } else {
+                mergedEnv.append(entry)
+            }
+        }
+        if !mergedEnv.isEmpty {
+            let lines = mergedEnv.map { pair in
                 let escaped = pair.value.replacingOccurrences(of: "'", with: "'\\''")
                 return "export \(pair.key)='\(escaped)'"
             }
@@ -1282,7 +1294,6 @@ final class MacOSSandboxManager: @unchecked Sendable {
         } else {
             try? fm.removeItem(at: envFileURL)
         }
-
         let setupScript = cfg.ephemeralSetup.sandboxSetupScript.trimmingCharacters(in: .whitespacesAndNewlines)
         let setupScriptURL = homeDir.appendingPathComponent(".boobox-setup.sh")
         if !setupScript.isEmpty {

@@ -294,6 +294,10 @@ struct CommandPaletteOverlay: View {
             ("Toggle Sidebar", "Show or hide the session sidebar", "sidebar.left", .secondary, "⌘B", { store.toggleSidebarVisibility() }),
             ("Flip Sidebar Side", "Move sidebar between left and right", "arrow.left.arrow.right", .secondary, nil, { store.toggleSidebarPosition() }),
             ("Settings…", "Open boo_box Settings", "gearshape", .secondary, "⌘,", { store.openSettings() }),
+            ("Connections (Apps & MCPs)…", "1-click setup for GitHub, cloud CLIs, MCP servers & LLM keys", "link.circle.fill", Color(red: 0.25, green: 0.84, blue: 0.72), nil, {
+                SettingsNavState.shared.selectedTab = .connections
+                store.openSettings()
+            }),
             ("Find in Terminal…", "Search scrollback in the active terminal pane", "magnifyingglass", .accentColor, "⌘F", { store.openTerminalSearch() }),
             ("Check for Updates…", "Check github.com/apguan/boo_box for updates", "arrow.down.circle", .accentColor, nil, {
                 SettingsNavState.shared.selectedTab = .general

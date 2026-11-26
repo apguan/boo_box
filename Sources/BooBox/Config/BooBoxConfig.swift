@@ -680,6 +680,10 @@ struct SandboxAccessConfig: Codable, Equatable, Sendable {
         if shareGHConfig {
             addRel(".config/gh")
         }
+        // Share MCP OAuth token cache (~/.mcp-auth) and Cloudflare Wrangler config so browser sign-ins persist across sandboxes
+        addRel(".mcp-auth", createIfMissing: true)
+        addRel(".wrangler")
+        addRel(".config/.wrangler")
         for raw in extraConfigPaths {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
@@ -935,9 +939,59 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
     }
 }
 
+struct ConnectionAccount: Codable, Equatable, Identifiable, Sendable {
+    /// Preset slug (e.g. `"github"`, `"cloudflare"`, `"vercel"`). Real token lives ONLY in macOS Keychain (`dev.boo-box.connections`).
+    var id: String
+    var enabled: Bool = true
+    var envVar: String
+    var accountLabel: String? = nil
+
+    init(id: String, enabled: Bool = true, envVar: String, accountLabel: String? = nil) {
+        self.id = id
+        self.enabled = enabled
+        self.envVar = envVar
+        self.accountLabel = accountLabel
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        self.envVar = try c.decodeIfPresent(String.self, forKey: .envVar) ?? ""
+        self.accountLabel = try c.decodeIfPresent(String.self, forKey: .accountLabel)
+    }
+}
+
+struct ConnectionsConfig: Codable, Equatable, Sendable {
+    /// Connected CLI/service accounts whose secret tokens are stored in macOS Keychain (`dev.boo-box.connections`).
+    var accounts: [ConnectionAccount] = []
+    /// Explicit MCP target agents (empty = auto-detect installed agents on this Mac).
+    var mcpTargetAgents: [String] = []
+    /// Share `~/.mcp-auth` across sandboxes so OAuth MCP browser logins persist.
+    var shareMCPAuth: Bool = true
+
+    init(
+        accounts: [ConnectionAccount] = [],
+        mcpTargetAgents: [String] = [],
+        shareMCPAuth: Bool = true
+    ) {
+        self.accounts = accounts
+        self.mcpTargetAgents = mcpTargetAgents
+        self.shareMCPAuth = shareMCPAuth
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.accounts = try c.decodeIfPresent([ConnectionAccount].self, forKey: .accounts) ?? []
+        self.mcpTargetAgents = try c.decodeIfPresent([String].self, forKey: .mcpTargetAgents) ?? []
+        self.shareMCPAuth = try c.decodeIfPresent(Bool.self, forKey: .shareMCPAuth) ?? true
+    }
+}
+
 struct BooBoxConfig: Codable, Equatable, Sendable {
     var version: Int = 1
     var general: GeneralConfig = GeneralConfig()
+    var connections: ConnectionsConfig = ConnectionsConfig()
     var ephemeralSetup: EphemeralSetupConfig = EphemeralSetupConfig()
     var sandboxAccess: SandboxAccessConfig = SandboxAccessConfig()
     var privateVM: PrivateVMConfig = PrivateVMConfig()
@@ -950,6 +1004,7 @@ struct BooBoxConfig: Codable, Equatable, Sendable {
     init(
         version: Int = 1,
         general: GeneralConfig = GeneralConfig(),
+        connections: ConnectionsConfig = ConnectionsConfig(),
         ephemeralSetup: EphemeralSetupConfig = EphemeralSetupConfig(),
         sandboxAccess: SandboxAccessConfig = SandboxAccessConfig(),
         privateVM: PrivateVMConfig = PrivateVMConfig(),
@@ -959,6 +1014,7 @@ struct BooBoxConfig: Codable, Equatable, Sendable {
     ) {
         self.version = version
         self.general = general
+        self.connections = connections
         self.ephemeralSetup = ephemeralSetup
         self.sandboxAccess = sandboxAccess
         self.privateVM = privateVM
@@ -971,6 +1027,7 @@ struct BooBoxConfig: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
         self.general = try c.decodeIfPresent(GeneralConfig.self, forKey: .general) ?? GeneralConfig()
+        self.connections = try c.decodeIfPresent(ConnectionsConfig.self, forKey: .connections) ?? ConnectionsConfig()
         let ephem = try c.decodeIfPresent(EphemeralSetupConfig.self, forKey: .ephemeralSetup) ?? EphemeralSetupConfig()
         self.ephemeralSetup = ephem
         var access = try c.decodeIfPresent(SandboxAccessConfig.self, forKey: .sandboxAccess) ?? SandboxAccessConfig()
@@ -983,7 +1040,6 @@ struct BooBoxConfig: Codable, Equatable, Sendable {
         self.packageCache = try c.decodeIfPresent(PackageCacheConfig.self, forKey: .packageCache) ?? PackageCacheConfig()
         self.appearance = try c.decodeIfPresent(AppearanceConfig.self, forKey: .appearance) ?? AppearanceConfig()
     }
-
     /// Merges per-sandbox overrides onto this global config snapshot without mutating globals.
     func applying(overrides o: SandboxOverrideConfig) -> BooBoxConfig {
         var copy = self

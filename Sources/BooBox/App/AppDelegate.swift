@@ -212,6 +212,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     excludeEnvOverride: (msg.noEnv == true) ? true : nil
                 )
             }
+        case "reload_config":
+            BooBoxConfigManager.shared.reloadFromDisk()
+            store?.reloadGhosttyConfig()
+            return
         case "activate":
             break
         default:
