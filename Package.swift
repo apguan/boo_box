@@ -23,6 +23,7 @@ let package = Package(
             path: "Sources/BooBox",
             linkerSettings: [
                 .linkedLibrary("c++"),
+                .linkedLibrary("sqlite3"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore"),

@@ -304,11 +304,20 @@ final class ConnectionsManager: @unchecked Sendable {
         ),
         MCPPreset(
             id: "cloudflare",
-            name: "Cloudflare Docs",
-            subtitle: "Search Workers, Pages, D1, and R2 docs via Cloudflare's official MCP.",
+            name: "Cloudflare",
+            subtitle: "Workers observability, logs, and analytics via Cloudflare OAuth MCP.",
             symbol: "cloud.fill",
-            transport: .remoteHTTP(url: "https://docs.mcp.cloudflare.com/mcp"),
+            transport: .remoteHTTP(url: "https://observability.mcp.cloudflare.com/mcp"),
             linkedConnectionID: "cloudflare",
+            docsURL: "https://developers.cloudflare.com/agents/model-context-protocol/"
+        ),
+        MCPPreset(
+            id: "cloudflare-docs",
+            name: "Cloudflare Docs",
+            subtitle: "Search Workers, Pages, D1, and R2 documentation (no login required).",
+            symbol: "book.closed.fill",
+            transport: .remoteHTTP(url: "https://docs.mcp.cloudflare.com/mcp"),
+            linkedConnectionID: nil,
             docsURL: "https://developers.cloudflare.com/agents/model-context-protocol/"
         ),
         MCPPreset(
@@ -377,7 +386,7 @@ final class ConnectionsManager: @unchecked Sendable {
         MCPPreset(
             id: "exa",
             name: "Exa Search",
-            subtitle: "Fast semantic web & developer search MCP (`EXA_API_KEY`).",
+            subtitle: "Fast semantic web and developer search MCP.",
             symbol: "sparkle.magnifyingglass",
             transport: .remoteHTTP(url: "https://mcp.exa.ai/mcp"),
             linkedConnectionID: "exa",
@@ -396,6 +405,14 @@ final class ConnectionsManager: @unchecked Sendable {
 
     static func preset(for id: String) -> ConnectionPreset? {
         connectionPresets.first { $0.id == id }
+    }
+
+    static func connectionPreset(id: String) -> ConnectionPreset? {
+        connectionPresets.first { $0.id == id }
+    }
+
+    static func mcpPreset(id: String) -> MCPPreset? {
+        mcpPresets.first { $0.id == id }
     }
 
     // MARK: - macOS Keychain Token Storage (Zero Plaintext in config.json)
