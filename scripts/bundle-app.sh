@@ -8,11 +8,12 @@ APP_BUNDLE="$ROOT/build/${APP_NAME}.app"
 BIN_DIR="$ROOT/.build/${CONFIG}"
 
 cd "$ROOT"
-echo "Building ${APP_NAME} + boobox-attach + boobox-clone + boobox-proxy (${CONFIG})..."
+echo "Building ${APP_NAME} + boobox-attach + boobox-clone + boobox-proxy + booboxd (${CONFIG})..."
 swift build -c "$CONFIG" --product boo_box
 swift build -c "$CONFIG" --product boobox-attach
 swift build -c release --product boobox-clone
 swift build -c "$CONFIG" --product boobox-proxy
+swift build -c "$CONFIG" --product booboxd
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/vm"
@@ -21,8 +22,8 @@ cp "$BIN_DIR/boo_box" "$APP_BUNDLE/Contents/MacOS/boo_box"
 cp "$BIN_DIR/boobox-attach" "$APP_BUNDLE/Contents/MacOS/boobox-attach"
 cp "$ROOT/.build/release/boobox-clone" "$APP_BUNDLE/Contents/MacOS/boobox-clone"
 cp "$BIN_DIR/boobox-proxy" "$APP_BUNDLE/Contents/MacOS/boobox-proxy"
-chmod +x "$APP_BUNDLE/Contents/MacOS/boo_box" "$APP_BUNDLE/Contents/MacOS/boobox-attach" "$APP_BUNDLE/Contents/MacOS/boobox-clone" "$APP_BUNDLE/Contents/MacOS/boobox-proxy"
-# App icon
+cp "$BIN_DIR/booboxd" "$APP_BUNDLE/Contents/MacOS/booboxd"
+chmod +x "$APP_BUNDLE/Contents/MacOS/boo_box" "$APP_BUNDLE/Contents/MacOS/boobox-attach" "$APP_BUNDLE/Contents/MacOS/boobox-clone" "$APP_BUNDLE/Contents/MacOS/boobox-proxy" "$APP_BUNDLE/Contents/MacOS/booboxd"
 if [ -f "$ROOT/Resources/boo_box.icns" ]; then
     cp "$ROOT/Resources/boo_box.icns" "$APP_BUNDLE/Contents/Resources/boo_box.icns"
 fi
@@ -121,10 +122,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Sign nested helper first, then main app with Virtualization.framework entitlement
+# Sign nested helpers first, then main app with Virtualization.framework entitlement
 codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-attach"
 codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-clone"
 codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-proxy"
+codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/booboxd"
 codesign --force --sign - --entitlements "$ROOT/Resources/boo_box.entitlements" "$APP_BUNDLE"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_BUNDLE" 2>/dev/null || true
 

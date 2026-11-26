@@ -3,7 +3,8 @@ import Foundation
 import Security
 
 struct ProxyAuditEventItem: Codable, Identifiable, Equatable, Sendable {
-    var id: String { "\(timestamp)-\(sessionId)-\(host)-\(decision)" }
+    var id: String { "\(seq ?? 0)-\(timestamp)-\(sessionId)-\(host)-\(decision)" }
+    let seq: UInt64?
     let timestamp: Double
     let sessionId: String
     let method: String
@@ -31,6 +32,7 @@ final class SecretsVaultManager: @unchecked Sendable {
 
     private let stateLock = NSLock()
     private var process: Process?
+    private var adoptedExternalProxy = false
     private var boundPort: UInt16 = 0
     private var phantomTokensBySecretID: [UUID: String] = [:]
     private var sessionProxyTokens: [String: String] = [:]
@@ -48,11 +50,10 @@ final class SecretsVaultManager: @unchecked Sendable {
     var currentProxyPort: UInt16? {
         stateLock.lock()
         let p = boundPort
-        let alive = process?.isRunning == true
+        let alive = (process?.isRunning == true) || adoptedExternalProxy
         stateLock.unlock()
         return (alive && p > 0) ? p : nil
     }
-
     var isRunning: Bool {
         currentProxyPort != nil
     }
@@ -202,10 +203,19 @@ final class SecretsVaultManager: @unchecked Sendable {
             return existing
         }
 
+        // Re-adopt an already-running `boobox-proxy` (kept alive for detached `booboxd` panes across restarts/updates)
+        if let adoptedPort = pingExistingProxy() {
+            stateLock.lock()
+            self.adoptedExternalProxy = true
+            self.boundPort = adoptedPort
+            stateLock.unlock()
+            syncPolicyToProxy(blocking: true)
+            return adoptedPort
+        }
+
         guard let binURL = resolveProxyBinaryURL() else {
             return nil
         }
-
         let proc = Process()
         proc.executableURL = binURL
         proc.arguments = ["--control-socket", controlSocketPath, "--port", "0"]
@@ -253,6 +263,7 @@ final class SecretsVaultManager: @unchecked Sendable {
         stateLock.lock()
         self.process?.terminate()
         self.process = proc
+        self.adoptedExternalProxy = false
         self.boundPort = port
         stateLock.unlock()
 
@@ -260,15 +271,31 @@ final class SecretsVaultManager: @unchecked Sendable {
         return port
     }
 
+    private func pingExistingProxy() -> UInt16? {
+        guard let req = try? JSONSerialization.data(withJSONObject: ["op": "ping"]),
+              let resp = sendControlCommand(req),
+              let obj = try? JSONSerialization.jsonObject(with: resp) as? [String: Any],
+              (obj["ok"] as? Bool) == true,
+              let portNum = obj["port"] as? Int,
+              portNum > 0 && portNum <= Int(UInt16.max) else {
+            return nil
+        }
+        return UInt16(portNum)
+    }
+
     func stop() {
         stateLock.lock()
         let proc = self.process
+        let wasAdopted = self.adoptedExternalProxy
         self.process = nil
+        self.adoptedExternalProxy = false
         self.boundPort = 0
         stateLock.unlock()
 
         if let proc, proc.isRunning {
             proc.terminate()
+        } else if wasAdopted, let req = try? JSONSerialization.data(withJSONObject: ["op": "shutdown"]) {
+            _ = sendControlCommand(req)
         }
         unlink(controlSocketPath)
     }
@@ -472,6 +499,19 @@ final class SecretsVaultManager: @unchecked Sendable {
                 return
             }
             DispatchQueue.main.async { completion(parsed.reversed()) }
+        }
+    }
+
+    func fetchAuditEventsSince(_ sinceSeq: UInt64, completion: @escaping @MainActor @Sendable ([ProxyAuditEventItem]) -> Void) {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            guard currentProxyPort != nil,
+                  let req = try? JSONSerialization.data(withJSONObject: ["op": "events_since", "sinceSeq": sinceSeq]),
+                  let resp = sendControlCommand(req),
+                  let parsed = try? JSONDecoder().decode([ProxyAuditEventItem].self, from: resp) else {
+                DispatchQueue.main.async { completion([]) }
+                return
+            }
+            DispatchQueue.main.async { completion(parsed) }
         }
     }
 

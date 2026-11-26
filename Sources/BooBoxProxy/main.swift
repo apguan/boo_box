@@ -30,6 +30,7 @@ struct ProxyConfigPayload: Codable, Sendable {
     let proxyToken: String?
     let extraAllowedDomains: [String]?      // per-session additional domains
     let allowedSecretEnvVars: [String]?     // nil = inherit all; [] = 0 secrets; [...] = subset
+    let sinceSeq: UInt64?
 }
 
 struct SessionPolicy: Sendable {
@@ -39,6 +40,7 @@ struct SessionPolicy: Sendable {
     let allowedSecretEnvVars: Set<String>?
 }
 struct ProxyAuditEvent: Codable, Sendable {
+    let seq: UInt64
     let timestamp: Double
     let sessionId: String
     let method: String
@@ -57,8 +59,8 @@ final class ProxyState: @unchecked Sendable {
     private var sessionTokens: [String: String] = [:]       // proxyToken -> sessionId
     private var sessionPolicies: [String: SessionPolicy] = [:] // sessionId -> policy
     private var events: [ProxyAuditEvent] = []
+    private var nextSeq: UInt64 = 1
     private let maxEvents = 250
-
     func updateConfig(egressMode: String?, allowedDomains: [String]?, secrets: [ProxySecretSpec]?) {
         lock.lock()
         if let m = egressMode { self.egressMode = m }
@@ -128,7 +130,11 @@ final class ProxyState: @unchecked Sendable {
         return (mode, domains, copySecrets, allowedEnvVars)
     }
     func record(sessionId: String, method: String, host: String, decision: String, reason: String) {
+        lock.lock()
+        let seq = nextSeq
+        nextSeq += 1
         let ev = ProxyAuditEvent(
+            seq: seq,
             timestamp: Date().timeIntervalSince1970,
             sessionId: sessionId,
             method: method,
@@ -136,7 +142,6 @@ final class ProxyState: @unchecked Sendable {
             decision: decision,
             reason: reason
         )
-        lock.lock()
         events.append(ev)
         if events.count > maxEvents {
             events.removeFirst(events.count - maxEvents)
@@ -144,9 +149,9 @@ final class ProxyState: @unchecked Sendable {
         lock.unlock()
     }
 
-    func recentEvents() -> [ProxyAuditEvent] {
+    func recentEvents(sinceSeq: UInt64 = 0) -> [ProxyAuditEvent] {
         lock.lock()
-        let copy = events
+        let copy = sinceSeq > 0 ? events.filter { $0.seq > sinceSeq } : events
         lock.unlock()
         return copy
     }
@@ -1050,8 +1055,8 @@ private func startControlServer(socketPath: String, boundPort: UInt16, state: Pr
                     state.unregisterSession(sessionId: sid)
                 }
                 _ = writeAll(fd: clientFD, data: Data("{\"ok\":true}\n".utf8))
-            case "events":
-                let evs = state.recentEvents()
+            case "events", "events_since":
+                let evs = state.recentEvents(sinceSeq: cmd.sinceSeq ?? 0)
                 if let encoded = try? JSONEncoder().encode(evs) {
                     var out = encoded
                     out.append(0x0A)
@@ -1064,6 +1069,11 @@ private func startControlServer(socketPath: String, boundPort: UInt16, state: Pr
                 _ = writeAll(fd: clientFD, data: Data("{\"ok\":true}\n".utf8))
             case "ping":
                 _ = writeAll(fd: clientFD, data: Data("{\"ok\":true,\"port\":\(boundPort)}\n".utf8))
+            case "shutdown":
+                _ = writeAll(fd: clientFD, data: Data("{\"ok\":true}\n".utf8))
+                close(clientFD)
+                unlink(socketPath)
+                exit(0)
             default:
                 _ = writeAll(fd: clientFD, data: Data("{\"ok\":false,\"error\":\"unknown_op\"}\n".utf8))
             }
@@ -1074,6 +1084,8 @@ private func startControlServer(socketPath: String, boundPort: UInt16, state: Pr
 // MARK: - Entry Point
 
 signal(SIGPIPE, SIG_IGN)
+signal(SIGHUP, SIG_IGN)
+_ = setsid()
 
 let cliArgs = Array(CommandLine.arguments.dropFirst())
 var controlSocketPath = NSHomeDirectory() + "/boo_box/run/proxy-ctl.sock"

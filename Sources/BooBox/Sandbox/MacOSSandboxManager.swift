@@ -945,6 +945,36 @@ final class MacOSSandboxManager: @unchecked Sendable {
         }
     }
 
+    /// Loads a single persisted sandbox session directory by `shortID` (e.g. `s-1a2b3c4d`) for relaunch restore.
+    func loadSession(shortID: String) -> MacSandboxSession? {
+        let fm = FileManager.default
+        let dir = sessionsRootURL.appendingPathComponent(shortID, isDirectory: true).resolvingSymlinksInPath()
+        let metaURL = dir.appendingPathComponent(".session.json")
+        let wsURL = dir.appendingPathComponent("workspace", isDirectory: true)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: metaURL),
+              let meta = try? decoder.decode(MacSandboxMetadata.self, from: data),
+              fm.fileExists(atPath: wsURL.path) else {
+            return nil
+        }
+        return MacSandboxSession(
+            id: meta.id,
+            shortID: meta.shortID,
+            name: meta.name,
+            createdAt: meta.createdAt,
+            hasUserCustomName: meta.hasUserCustomName,
+            sourceProjectPath: meta.sourceProjectPath,
+            overrides: meta.overrides,
+            sessionDir: dir,
+            workspaceDir: wsURL,
+            homeDir: dir.appendingPathComponent(".home", isDirectory: true),
+            tmpDir: dir.appendingPathComponent(".tmp", isDirectory: true),
+            profileURL: dir.appendingPathComponent(".sandbox.sb"),
+            metadataURL: metaURL
+        )
+    }
+
     func loadSavedSessions(excludingActive activeIDs: Set<UUID> = []) -> [SavedMacSandboxItem] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
