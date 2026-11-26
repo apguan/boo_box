@@ -235,9 +235,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         GhosttyRuntime.shared.syncColorScheme()
-        store?.refocusActiveTerminal()
+        if (notification.object as? NSWindow) === mainWindow {
+            store?.refocusActiveTerminal()
+        }
     }
 
+    func windowWillClose(_ notification: Notification) {
+        guard let closed = notification.object as? NSWindow, closed === mainWindow else { return }
+        if let settings = settingsWindow {
+            settingsWindow = nil
+            settings.close()
+        }
+    }
     // MARK: - Window Setup
 
     private func createMainWindow(store: SessionStore) {
@@ -408,6 +417,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func closeActivePane(_ sender: Any?) {
+        if let key = NSApp.keyWindow, key !== mainWindow {
+            key.performClose(sender)
+            return
+        }
         if store?.sessions.isEmpty == true {
             mainWindow?.performClose(nil)
             return

@@ -28,14 +28,14 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-private final class SettingsNavState: ObservableObject {
-    @Published var selectedTab: SettingsTab = .setup
+final class SettingsNavState: ObservableObject {
+    static let shared = SettingsNavState()
+    @Published var selectedTab: SettingsTab = .general
 }
 
 struct SettingsView: View {
     @ObservedObject var configManager: BooBoxConfigManager
-    @StateObject private var nav = SettingsNavState()
-
+    @ObservedObject private var nav = SettingsNavState.shared
     var body: some View {
         HStack(spacing: 0) {
             // Left navigation rail
