@@ -1,28 +1,34 @@
 import AppKit
 import SwiftUI
 
+private enum MCPFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case oauth = "OAuth Apps"
+    case tools = "No-Login Tools"
+
+    var id: String { rawValue }
+}
+
 @MainActor
 private final class ConnectionsUIState: ObservableObject {
     @Published var searchQuery: String = ""
+    @Published var mcpFilter: MCPFilter = .all
     @Published var detectedAgents: [MCPAgentTarget] = []
     @Published var oauthConnectedByID: [String: Bool] = [:]
     @Published var mcpInstalledByID: [String: Set<MCPAgentTarget>] = [:]
-    @Published var keychainPresentByID: [String: Bool] = [:]
-    @Published var llmPresentByEnv: [String: Bool] = [:]
+    @Published var githubAccountLabel: String? = nil
 
-    /// Active OAuth sign-in flow state (service ID, live status message, optional GitHub device code).
+    /// Active OAuth sign-in state (service ID, live message, optional GitHub device code).
     @Published var signingInServiceID: String? = nil
     @Published var signingInMessage: String? = nil
     @Published var signingInDeviceCode: String? = nil
 
-    /// Busy ID for non-OAuth toggles/advanced saves.
-    @Published var busyID: String? = nil
+    /// Optional collapsed inline fine-grained PAT override under GitHub.
+    @Published var editingGitHubPAT: Bool = false
+    @Published var draftGitHubPAT: String = ""
 
-    /// Collapsed by default so the default view stays 100% 1-click OAuth!
-    @Published var showAdvanced: Bool = false
-    @Published var editingAdvancedID: String? = nil
-    @Published var editingLLMEnvVar: String? = nil
-    @Published var draftToken: String = ""
+    /// Busy ID for MCP toggle / sync actions.
+    @Published var busyID: String? = nil
 
     @Published var statusBanner: String? = nil
     @Published var statusIsError: Bool = false
@@ -30,8 +36,7 @@ private final class ConnectionsUIState: ObservableObject {
     func refreshStatus(config: BooBoxConfig) {
         let mgr = ConnectionsManager.shared
         let oauth = OAuthFlowManager.shared
-        let vault = SecretsVaultManager.shared
-        let secrets = config.secretsNetwork.secrets
+        let ghLabel = config.connections.accounts.first(where: { $0.id == "github" })?.accountLabel
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let agents = mgr.detectInstalledAgents()
@@ -46,28 +51,12 @@ private final class ConnectionsUIState: ObservableObject {
                 mcpMap[preset.id] = mgr.agentsWithMCPInstalled(preset.id)
             }
 
-            var keyMap: [String: Bool] = [:]
-            for preset in ConnectionsManager.connectionPresets {
-                keyMap[preset.id] = mgr.hasToken(for: preset.id)
-            }
-
-            var llmMap: [String: Bool] = [:]
-            for preset in VaultSecretEntry.presets {
-                if let entry = secrets.first(where: { $0.envVar == preset.envVar }) {
-                    llmMap[preset.envVar] = (entry.source == .keychain && vault.hasKeychainSecret(for: entry.id))
-                        || (entry.source == .onePassword && !entry.onePasswordRef.isEmpty)
-                } else {
-                    llmMap[preset.envVar] = false
-                }
-            }
-
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.detectedAgents = agents
                 self.oauthConnectedByID = oauthMap
                 self.mcpInstalledByID = mcpMap
-                self.keychainPresentByID = keyMap
-                self.llmPresentByEnv = llmMap
+                self.githubAccountLabel = ghLabel
             }
         }
     }
@@ -77,21 +66,25 @@ struct ConnectionsSettingsTab: View {
     @ObservedObject var configManager: BooBoxConfigManager
     @StateObject private var state = ConnectionsUIState()
 
-    private static let instantToolIDs: [String] = [
+    /// OAuth MCP services (excluding GitHub, which lives in the dedicated Sandbox Shell Auth card).
+    private var oauthMCPServices: [OAuthServicePreset] {
+        OAuthFlowManager.oauthServices.filter { $0.id != "github" }
+    }
+
+    private var githubService: OAuthServicePreset? {
+        OAuthFlowManager.oauthServices.first { $0.id == "github" }
+    }
+
+    /// Agent-managed OAuth MCPs (install config in 1 click; agent opens browser OAuth on first call).
+    private static let agentOAuthMCPIDs: [String] = ["figma", "slack"]
+
+    /// Zero-login / local MCPs (no external OAuth flow needed).
+    private static let noLoginMCPIDs: [String] = [
         "context7",
         "cloudflare-docs",
         "playwright",
         "sequential-thinking",
-        "figma",
-        "slack",
-    ]
-
-    private static let advancedManualCLIs: [String] = [
         "github",
-        "npm",
-        "fly",
-        "exa",
-        "firecrawl",
     ]
 
     private var activeTargetAgents: [MCPAgentTarget] {
@@ -101,12 +94,15 @@ struct ConnectionsSettingsTab: View {
         return [.omp, .opencode, .claude]
     }
 
-    private var connectedOAuthCount: Int {
-        OAuthFlowManager.oauthServices.filter { state.oauthConnectedByID[$0.id] == true }.count
+    private var isGitHubConnected: Bool {
+        state.oauthConnectedByID["github"] == true
     }
 
-    private var activeToolsCount: Int {
-        Self.instantToolIDs.filter { !(state.mcpInstalledByID[$0] ?? []).isEmpty }.count
+    private var connectedMCPCount: Int {
+        let oauthCount = oauthMCPServices.filter { state.oauthConnectedByID[$0.id] == true }.count
+        let otherIDs = Self.agentOAuthMCPIDs + Self.noLoginMCPIDs
+        let otherCount = otherIDs.filter { !(state.mcpInstalledByID[$0] ?? []).isEmpty }.count
+        return oauthCount + otherCount
     }
 
     private func matchesSearch(_ fields: String...) -> Bool {
@@ -118,82 +114,12 @@ struct ConnectionsSettingsTab: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                // Header
-                HStack(alignment: .top) {
-                    SettingsHeader(
-                        title: "Connections",
-                        subtitle: "1-click browser OAuth for your tools and coding agents. Credentials stay in macOS Keychain and sync across every sandbox."
-                    )
-                    Spacer()
-                }
+                SettingsHeader(
+                    title: "Connections",
+                    subtitle: "Two clean layers: Sandbox Git auth for your terminal shells, and 1-click MCP servers for your coding agents."
+                )
 
-                // Compact status + search bar
-                HStack(spacing: 8) {
-                    summaryPill("\(connectedOAuthCount) connected", color: Color(red: 0.25, green: 0.84, blue: 0.72), symbol: "checkmark.shield.fill")
-                    if activeToolsCount > 0 {
-                        summaryPill("\(activeToolsCount) tools active", color: .accentColor, symbol: "puzzlepiece.extension.fill")
-                    }
-                    Spacer()
-                    HStack(spacing: 5) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                        TextField("Search apps & tools…", text: $state.searchQuery)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 12))
-                            .frame(width: 155)
-                        if !state.searchQuery.isEmpty {
-                            Button {
-                                state.searchQuery = ""
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Color.primary.opacity(0.06))
-                    )
-                }
-
-                // Target agent selector pills
-                HStack(spacing: 6) {
-                    Text("Sync to:")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    ForEach(MCPAgentTarget.allCases) { agent in
-                        let isSelected = activeTargetAgents.contains(agent)
-                        let isDetected = state.detectedAgents.contains(agent)
-                        Button {
-                            toggleTargetAgent(agent)
-                        } label: {
-                            HStack(spacing: 4.5) {
-                                Circle()
-                                    .fill(isSelected ? Color(red: 0.25, green: 0.84, blue: 0.72) : Color.secondary.opacity(0.3))
-                                    .frame(width: 5.5, height: 5.5)
-                                Text(agent.displayName)
-                                    .font(.system(size: 10.5, weight: isSelected ? .semibold : .regular))
-                            }
-                            .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-                            .padding(.horizontal, 8.5)
-                            .padding(.vertical, 3.5)
-                            .background(
-                                Capsule()
-                                    .fill(isSelected ? Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.16) : Color.primary.opacity(0.05))
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .help(isDetected ? "\(agent.displayName) detected on this Mac — click to toggle sync" : "Click to include \(agent.displayName) in 1-click OAuth sync")
-                    }
-                    Spacer()
-                }
-
-                // Live OAuth in-progress banner (with Cancel button & GitHub device code if applicable)
+                // Live OAuth in-progress banner (with Cancel + optional GitHub device code)
                 if let activeID = state.signingInServiceID, let msg = state.signingInMessage {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
@@ -208,7 +134,7 @@ struct ConnectionsSettingsTab: View {
                         }
                         Spacer()
                         Button("Cancel") {
-                            cancelOAuthSignIn()
+                            OAuthFlowManager.shared.cancelActiveFlow()
                         }
                         .controlSize(.small)
                     }
@@ -253,71 +179,148 @@ struct ConnectionsSettingsTab: View {
                     )
                 }
 
-                // 1. HERO: 1-Click OAuth Connections (ZERO API key pasting!)
-                let oauthItems = OAuthFlowManager.oauthServices.filter {
-                    matchesSearch($0.name, $0.subtitle, $0.id)
-                }
-                if !oauthItems.isEmpty {
-                    SettingsCard(title: "1-Click OAuth Connections") {
+                // SECTION 1: SANDBOX SHELL AUTH (Terminal `git` & `gh` commands)
+                if let gh = githubService {
+                    SettingsCard(title: "Sandbox Shell Auth (Terminal Commands)") {
                         VStack(alignment: .leading, spacing: 10) {
-                            ForEach(Array(oauthItems.enumerated()), id: \.element.id) { idx, service in
-                                if idx > 0 { Divider() }
-                                oauthServiceRow(service)
-                            }
+                            githubShellRow(gh)
                         }
                     }
                 }
 
-                // 2. Instant Tools (No Login Required / Agent-Managed)
-                let instantTools = Self.instantToolIDs.compactMap { ConnectionsManager.mcpPreset(id: $0) }.filter {
-                    matchesSearch($0.name, $0.subtitle, $0.id)
-                }
-                if !instantTools.isEmpty {
-                    SettingsCard(title: "Instant Tools & Docs") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            ForEach(Array(instantTools.enumerated()), id: \.element.id) { idx, preset in
-                                if idx > 0 { Divider() }
-                                instantToolRow(preset)
-                            }
-                        }
-                    }
-                }
-
-                // 3. Collapsed Disclosure: Advanced LLM API Keys & Manual Tokens
-                VStack(alignment: .leading, spacing: 10) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            state.showAdvanced.toggle()
-                        }
-                    } label: {
+                // SECTION 2: AGENT MCP SERVERS (Explicitly scoped to OMP / OpenCode / Claude / Codex / Gemini)
+                SettingsCard(title: "Agent MCP Servers (\(connectedMCPCount) active)") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Agent target pills + search inside the MCP card so scope is unmistakable
                         HStack(spacing: 6) {
-                            Image(systemName: state.showAdvanced ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 10, weight: .semibold))
+                            Text("Sync to:")
+                                .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(.secondary)
-                                .frame(width: 12)
-                            Text("Advanced: LLM API Keys & Manual Tokens")
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundStyle(.secondary)
+                            ForEach(MCPAgentTarget.allCases) { agent in
+                                let isSelected = activeTargetAgents.contains(agent)
+                                let isDetected = state.detectedAgents.contains(agent)
+                                Button {
+                                    toggleTargetAgent(agent)
+                                } label: {
+                                    HStack(spacing: 4.5) {
+                                        Circle()
+                                            .fill(isSelected ? Color(red: 0.25, green: 0.84, blue: 0.72) : Color.secondary.opacity(0.3))
+                                            .frame(width: 5.5, height: 5.5)
+                                        Text(agent.displayName)
+                                            .font(.system(size: 10.5, weight: isSelected ? .semibold : .regular))
+                                    }
+                                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3.5)
+                                    .background(
+                                        Capsule()
+                                            .fill(isSelected ? Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.16) : Color.primary.opacity(0.05))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .help(isDetected ? "\(agent.displayName) detected on this Mac — click to toggle MCP sync" : "Click to include \(agent.displayName) in MCP installs")
+                            }
                             Spacer()
-                            Text("Keychain / Proxy Vault")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.tertiary)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .fill(Color.primary.opacity(0.035))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                        .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
-                                )
-                        )
-                    }
-                    .buttonStyle(.plain)
 
-                    if state.showAdvanced {
-                        advancedSection
+                        // Filter pills + search
+                        HStack(spacing: 6) {
+                            ForEach(MCPFilter.allCases) { f in
+                                let active = state.mcpFilter == f
+                                Button(f.rawValue) {
+                                    state.mcpFilter = f
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 11, weight: active ? .semibold : .regular))
+                                .foregroundStyle(active ? Color.accentColor : .secondary)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule()
+                                        .fill(active ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.05))
+                                )
+                            }
+                            Spacer()
+                            HStack(spacing: 5) {
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                TextField("Filter MCPs…", text: $state.searchQuery)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 11.5))
+                                    .frame(width: 135)
+                                if !state.searchQuery.isEmpty {
+                                    Button {
+                                        state.searchQuery = ""
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color.primary.opacity(0.06))
+                            )
+                        }
+
+                        Text("OAuth Apps open browser sign-in from boo_box and sync live tokens directly into OMP & OpenCode (Claude Code, Codex & Gemini register the server URL).")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+
+                        // 2a. 1-Click Browser OAuth MCPs
+                        if state.mcpFilter == .all || state.mcpFilter == .oauth {
+                            let oauthMCPs = oauthMCPServices.filter {
+                                matchesSearch($0.name, $0.subtitle, $0.id)
+                            }
+                            ForEach(Array(oauthMCPs.enumerated()), id: \.element.id) { idx, service in
+                                if idx > 0 { Divider() }
+                                oauthMCPRow(service)
+                            }
+
+                            // Agent-managed OAuth MCPs (Figma, Slack) — honestly labeled
+                            let agentOAuths = Self.agentOAuthMCPIDs.compactMap { ConnectionsManager.mcpPreset(id: $0) }.filter {
+                                matchesSearch($0.name, $0.subtitle, $0.id)
+                            }
+                            ForEach(agentOAuths) { preset in
+                                Divider()
+                                standardMCPRow(preset, badge: "Agent OAuth")
+                            }
+                        }
+
+                        // 2b. No-Login Local & Docs MCPs
+                        if state.mcpFilter == .all || state.mcpFilter == .tools {
+                            let tools = Self.noLoginMCPIDs.compactMap { ConnectionsManager.mcpPreset(id: $0) }.filter {
+                                matchesSearch($0.name, $0.subtitle, $0.id)
+                            }
+                            ForEach(Array(tools.enumerated()), id: \.element.id) { idx, preset in
+                                if state.mcpFilter == .all || idx > 0 { Divider() }
+                                let badge = preset.id == "github" ? "Uses GitHub Auth" : "No Login"
+                                standardMCPRow(preset, badge: badge)
+                            }
+                        }
+                    }
+                }
+
+                // SECTION 3: CLEAN LINKS TO EXISTING SPECIALIZED TABS (ZERO DUPLICATION)
+                HStack(spacing: 12) {
+                    jumpLinkButton(
+                        title: "LLM API Keys (Proxy Vault)",
+                        subtitle: "Anthropic, OpenAI, OpenRouter, Gemini",
+                        symbol: "key.fill"
+                    ) {
+                        SettingsNavState.shared.selectedTab = .secretsNetwork
+                    }
+                    jumpLinkButton(
+                        title: "Custom Shell Env Vars",
+                        subtitle: "NPM_TOKEN, FLY_API_TOKEN, etc.",
+                        symbol: "shippingbox"
+                    ) {
+                        SettingsNavState.shared.selectedTab = .setup
                     }
                 }
             }
@@ -331,9 +334,102 @@ struct ConnectionsSettingsTab: View {
         }
     }
 
-    // MARK: - 1-Click OAuth Row
+    // MARK: - Section 1: GitHub Shell Row
 
-    private func oauthServiceRow(_ service: OAuthServicePreset) -> some View {
+    private func githubShellRow(_ service: OAuthServicePreset) -> some View {
+        let isConnected = isGitHubConnected
+        let isSigningIn = state.signingInServiceID == "github"
+        let anySigningIn = state.signingInServiceID != nil
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: service.symbol)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(isConnected ? Color(red: 0.25, green: 0.84, blue: 0.72) : .secondary)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(isConnected ? Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.13) : Color.primary.opacity(0.06))
+                    )
+
+                VStack(alignment: .leading, spacing: 2.5) {
+                    HStack(spacing: 6) {
+                        Text("GitHub (git + gh CLI)")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        if isConnected {
+                            let badge = state.githubAccountLabel.flatMap { $0.isEmpty ? nil : "Connected · \($0)" } ?? "Connected ✓"
+                            Text(badge)
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.green)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1.5)
+                                .background(Capsule().fill(Color.green.opacity(0.14)))
+                        }
+                    }
+                    Text("Authenticates HTTPS git pull/push and gh CLI across all open & new sandboxes (live hot-reload; token stays in Seatbelt-blocked ~/boo_box/vault).")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                HStack(spacing: 6) {
+                    if isSigningIn {
+                        ProgressView().controlSize(.mini)
+                        Button("Cancel") {
+                            OAuthFlowManager.shared.cancelActiveFlow()
+                        }
+                        .controlSize(.small)
+                    } else if isConnected {
+                        Button("Use Scoped PAT") {
+                            state.editingGitHubPAT.toggle()
+                            state.draftGitHubPAT = ""
+                        }
+                        .controlSize(.small)
+                        Button("Disconnect", role: .destructive) {
+                            disconnectOAuthService(service)
+                        }
+                        .controlSize(.small)
+                        .disabled(anySigningIn)
+                    } else {
+                        Button("Connect") {
+                            startOAuthSignIn(service)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(anySigningIn)
+                    }
+                }
+            }
+
+            if state.editingGitHubPAT {
+                HStack(spacing: 8) {
+                    SecureField("Paste fine-grained PAT (github_pat_…)", text: $state.draftGitHubPAT)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .onSubmit { saveCustomGitHubPAT() }
+                    Button("Save") {
+                        saveCustomGitHubPAT()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(state.draftGitHubPAT.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Create PAT ↗") {
+                        if let url = URL(string: "https://github.com/settings/personal-access-tokens/new") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.leading, 38)
+            }
+        }
+    }
+
+    // MARK: - Section 2: MCP Rows
+
+    private func oauthMCPRow(_ service: OAuthServicePreset) -> some View {
         let isConnected = state.oauthConnectedByID[service.id] == true
         let isSigningIn = state.signingInServiceID == service.id
         let anySigningIn = state.signingInServiceID != nil
@@ -343,35 +439,33 @@ struct ConnectionsSettingsTab: View {
 
         return HStack(alignment: .center, spacing: 10) {
             Image(systemName: service.symbol)
-                .font(.system(size: 13.5, weight: .medium))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(isConnected ? Color(red: 0.25, green: 0.84, blue: 0.72) : .secondary)
                 .frame(width: 26, height: 26)
                 .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    RoundedRectangle(cornerRadius: 6.5, style: .continuous)
                         .fill(isConnected ? Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.13) : Color.primary.opacity(0.06))
                 )
 
             VStack(alignment: .leading, spacing: 2.5) {
                 HStack(spacing: 6) {
                     Text(service.name)
-                        .font(.system(size: 12.5, weight: .semibold))
-
+                        .font(.system(size: 12.5, weight: .medium))
                     if isConnected {
                         Text("Connected ✓")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.system(size: 9.5, weight: .semibold))
                             .foregroundStyle(.green)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
+                            .padding(.horizontal, 5.5)
+                            .padding(.vertical, 1)
                             .background(Capsule().fill(Color.green.opacity(0.14)))
                     } else {
-                        Text("OAuth")
+                        Text("Browser OAuth")
                             .font(.system(size: 9.5, weight: .medium))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 5.5)
                             .padding(.vertical, 1)
                             .background(Capsule().fill(Color.primary.opacity(0.07)))
                     }
-
                     ForEach(MCPAgentTarget.allCases.filter { installedAgents.contains($0) }) { agent in
                         Text("\(agent.displayName) ✓")
                             .font(.system(size: 9.5, weight: .semibold))
@@ -393,7 +487,7 @@ struct ConnectionsSettingsTab: View {
                 if isSigningIn {
                     ProgressView().controlSize(.mini)
                     Button("Cancel") {
-                        cancelOAuthSignIn()
+                        OAuthFlowManager.shared.cancelActiveFlow()
                     }
                     .controlSize(.small)
                 } else if isConnected {
@@ -422,13 +516,12 @@ struct ConnectionsSettingsTab: View {
         }
     }
 
-    // MARK: - Instant Tool Row
-
-    private func instantToolRow(_ preset: MCPPreset) -> some View {
+    private func standardMCPRow(_ preset: MCPPreset, badge: String) -> some View {
         let installedIn = state.mcpInstalledByID[preset.id] ?? []
         let targets = Set(activeTargetAgents)
         let partiallyInstalled = !installedIn.isEmpty && !targets.isEmpty && !targets.isSubset(of: installedIn)
         let isBusy = state.busyID == "tool:\(preset.id)"
+        let needsGitHub = preset.id == "github" && !isGitHubConnected
 
         return HStack(alignment: .center, spacing: 10) {
             Image(systemName: preset.symbol)
@@ -436,7 +529,7 @@ struct ConnectionsSettingsTab: View {
                 .foregroundStyle(!installedIn.isEmpty ? Color.accentColor : .secondary)
                 .frame(width: 26, height: 26)
                 .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    RoundedRectangle(cornerRadius: 6.5, style: .continuous)
                         .fill(Color.primary.opacity(0.06))
                 )
 
@@ -444,12 +537,12 @@ struct ConnectionsSettingsTab: View {
                 HStack(spacing: 6) {
                     Text(preset.name)
                         .font(.system(size: 12.5, weight: .medium))
-                    Text(preset.transport.badgeLabel)
+                    Text(badge)
                         .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
+                        .foregroundStyle(needsGitHub ? .orange : .secondary)
+                        .padding(.horizontal, 5.5)
                         .padding(.vertical, 1)
-                        .background(Capsule().fill(Color.primary.opacity(0.07)))
+                        .background(Capsule().fill((needsGitHub ? Color.orange : Color.primary).opacity(needsGitHub ? 0.14 : 0.07)))
                     ForEach(MCPAgentTarget.allCases.filter { installedIn.contains($0) }) { agent in
                         Text("\(agent.displayName) ✓")
                             .font(.system(size: 9.5, weight: .semibold))
@@ -472,245 +565,60 @@ struct ConnectionsSettingsTab: View {
                 if !installedIn.isEmpty {
                     if partiallyInstalled {
                         Button("Sync All") {
-                            installInstantTool(preset)
+                            installMCP(preset)
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .disabled(isBusy)
                     }
                     Button("Remove", role: .destructive) {
-                        removeInstantTool(preset)
+                        removeMCP(preset)
                     }
                     .controlSize(.small)
                     .disabled(isBusy)
                 } else {
                     Button("Enable") {
-                        installInstantTool(preset)
+                        installMCP(preset)
                     }
                     .controlSize(.small)
-                    .disabled(isBusy)
+                    .disabled(isBusy || needsGitHub)
                 }
             }
         }
     }
 
-    // MARK: - Advanced Section (LLM API Keys & Manual CLI Tokens)
-
-    private var advancedSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            SettingsCard(title: "LLM Providers (Proxy-Protected Phantom Tokens)") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Real API keys stay strictly on your host Mac in Keychain and are swapped by boobox-proxy only on bound provider hosts. Sandboxes only see worthless bbx_ph_… phantom tokens.")
-                        .font(.system(size: 11))
+    private func jumpLinkButton(title: String, subtitle: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: symbol)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text(title)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.system(size: 10))
                         .foregroundStyle(.secondary)
-                    ForEach(Array(VaultSecretEntry.presets.enumerated()), id: \.element.id) { idx, preset in
-                        if idx > 0 { Divider() }
-                        llmProviderRow(preset)
-                    }
+                        .lineLimit(1)
                 }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
             }
-
-            SettingsCard(title: "Manual CLI Tokens (Services Without OAuth)") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Optional Keychain-backed tokens for registries and CLIs that don't support browser OAuth (or to override GitHub with a repo-scoped fine-grained PAT).")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    let manuals = Self.advancedManualCLIs.compactMap { ConnectionsManager.connectionPreset(id: $0) }
-                    ForEach(Array(manuals.enumerated()), id: \.element.id) { idx, preset in
-                        if idx > 0 { Divider() }
-                        manualTokenRow(preset)
-                    }
-                }
-            }
-        }
-    }
-
-    private func llmProviderRow(_ preset: VaultSecretEntry.Preset) -> some View {
-        let isConnected = state.llmPresentByEnv[preset.envVar] == true
-        let isEditing = state.editingLLMEnvVar == preset.envVar
-
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(isConnected ? .green : .secondary)
-                    .frame(width: 24, height: 24)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.primary.opacity(0.06))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.primary.opacity(0.035))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
                     )
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(preset.label)
-                            .font(.system(size: 12.5, weight: .medium))
-                        Text(preset.envVar)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        if isConnected {
-                            Text("Proxy Protected ✓")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.green)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1.5)
-                                .background(Capsule().fill(Color.green.opacity(0.14)))
-                        }
-                    }
-                    Text("Injected via boobox-proxy only to \(preset.allowedHosts.joined(separator: ", ")).")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                HStack(spacing: 6) {
-                    if isConnected {
-                        Button(isEditing ? "Cancel" : "Update") {
-                            if isEditing {
-                                state.editingLLMEnvVar = nil
-                                state.draftToken = ""
-                            } else {
-                                state.editingAdvancedID = nil
-                                state.editingLLMEnvVar = preset.envVar
-                                state.draftToken = ""
-                            }
-                        }
-                        .controlSize(.small)
-                        Button("Remove", role: .destructive) {
-                            removeLLMKey(preset)
-                        }
-                        .controlSize(.small)
-                    } else {
-                        Button(isEditing ? "Cancel" : "Add Key") {
-                            if isEditing {
-                                state.editingLLMEnvVar = nil
-                                state.draftToken = ""
-                            } else {
-                                state.editingAdvancedID = nil
-                                state.editingLLMEnvVar = preset.envVar
-                                state.draftToken = ""
-                            }
-                        }
-                        .controlSize(.small)
-                    }
-                }
-            }
-
-            if isEditing {
-                HStack(spacing: 8) {
-                    SecureField("Paste \(preset.label) API key…", text: $state.draftToken)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .onSubmit { saveLLMKey(preset) }
-                    Button("Save to Vault") {
-                        saveLLMKey(preset)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(state.draftToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                .padding(.leading, 34)
-            }
+            )
         }
-    }
-
-    private func manualTokenRow(_ preset: ConnectionPreset) -> some View {
-        let hasKey = state.keychainPresentByID[preset.id] == true
-        let isEditing = state.editingAdvancedID == preset.id
-
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: preset.symbol)
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(hasKey ? .green : .secondary)
-                    .frame(width: 24, height: 24)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.primary.opacity(0.06))
-                    )
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(preset.id == "github" ? "GitHub (Custom PAT Override)" : preset.name)
-                            .font(.system(size: 12, weight: .medium))
-                        Text(preset.envVar)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        if hasKey {
-                            Text("Saved ✓")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.green)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1.5)
-                                .background(Capsule().fill(Color.green.opacity(0.14)))
-                        }
-                    }
-                    Text(preset.subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 8)
-                HStack(spacing: 6) {
-                    if preset.supportsHostImport && !hasKey {
-                        Button("Import") {
-                            importManualCLI(preset)
-                        }
-                        .controlSize(.small)
-                    }
-                    Button(isEditing ? "Cancel" : (hasKey ? "Update" : "Set Token")) {
-                        if isEditing {
-                            state.editingAdvancedID = nil
-                            state.draftToken = ""
-                        } else {
-                            state.editingLLMEnvVar = nil
-                            state.editingAdvancedID = preset.id
-                            state.draftToken = ""
-                        }
-                    }
-                    .controlSize(.small)
-                    if hasKey {
-                        Button("Remove", role: .destructive) {
-                            removeManualToken(preset)
-                        }
-                        .controlSize(.small)
-                    }
-                }
-            }
-
-            if isEditing {
-                HStack(spacing: 8) {
-                    SecureField(preset.placeholder, text: $state.draftToken)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .onSubmit { saveManualToken(preset) }
-                    Button("Save to Keychain") {
-                        saveManualToken(preset)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(state.draftToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    Button("Get Token ↗") {
-                        if let url = URL(string: preset.tokenURL) { NSWorkspace.shared.open(url) }
-                    }
-                    .controlSize(.small)
-                }
-                .padding(.leading, 34)
-            }
-        }
-    }
-
-    private func summaryPill(_ text: String, color: Color, symbol: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: symbol)
-                .font(.system(size: 10.5))
-                .foregroundStyle(color)
-            Text(text)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.primary)
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 4)
-        .background(
-            Capsule()
-                .fill(color.opacity(0.13))
-                .overlay(Capsule().strokeBorder(color.opacity(0.24), lineWidth: 1))
-        )
+        .buttonStyle(.plain)
     }
 
     // MARK: - Actions
@@ -775,15 +683,45 @@ struct ConnectionsSettingsTab: View {
         }
     }
 
-    private func cancelOAuthSignIn() {
-        OAuthFlowManager.shared.cancelActiveFlow()
+    private func saveCustomGitHubPAT() {
+        let token = state.draftGitHubPAT.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try ConnectionsManager.shared.saveToken(token, for: "github")
+                let label = ConnectionsManager.shared.configureHostGitForGitHub(token: token)
+                DispatchQueue.main.async {
+                    self.upsertConnectionMetadata(id: "github", envVar: "GH_TOKEN", enabled: true, accountLabel: label)
+                    self.configManager.config.sandboxAccess.allowHostGitConfig = true
+                    self.configManager.config.sandboxAccess.shareGHConfig = true
+                    self.configManager.onSyncLiveEnv?()
+                    self.state.draftGitHubPAT = ""
+                    self.state.editingGitHubPAT = false
+                    self.state.statusIsError = false
+                    self.state.statusBanner = "Updated GitHub token in host vault — active across all sandboxes."
+                    self.state.refreshStatus(config: self.configManager.config)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.state.statusIsError = true
+                    self.state.statusBanner = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func syncExistingOAuthToAgents(service: OAuthServicePreset, mcpPreset: MCPPreset) {
         let targets = activeTargetAgents
         state.busyID = "sync:\(service.id)"
         DispatchQueue.global(qos: .userInitiated).async {
-            if let record = OAuthFlowManager.shared.loadTokenRecord(serviceID: service.id) {
+            var record = OAuthFlowManager.shared.loadTokenRecord(serviceID: service.id)
+            if record == nil, case .mcpOAuthDCR(let mcpURL, _) = service.kind {
+                record = OAuthFlowManager.shared.readOMPOAuthCredential(serviceID: service.id, mcpURL: mcpURL)
+                if let r = record {
+                    try? OAuthFlowManager.shared.saveTokenRecord(r)
+                }
+            }
+            if let record {
                 OAuthFlowManager.shared.writeOMPOAuthCredential(record: record)
                 OAuthFlowManager.shared.writeOpenCodeOAuthCredential(record: record)
             }
@@ -793,7 +731,7 @@ struct ConnectionsSettingsTab: View {
                 DispatchQueue.main.async {
                     self.state.busyID = nil
                     self.state.statusIsError = false
-                    self.state.statusBanner = "Synced \(service.name) to \(names)."
+                    self.state.statusBanner = "Synced \(service.name) MCP & OAuth credentials to \(names)."
                     self.state.refreshStatus(config: self.configManager.config)
                 }
             } catch {
@@ -817,13 +755,13 @@ struct ConnectionsSettingsTab: View {
                 }
                 self.configManager.onSyncLiveEnv?()
                 self.state.statusIsError = false
-                self.state.statusBanner = "Disconnected \(service.name) and removed OAuth credentials."
+                self.state.statusBanner = "Disconnected \(service.name) and removed credentials."
                 self.state.refreshStatus(config: self.configManager.config)
             }
         }
     }
 
-    private func installInstantTool(_ preset: MCPPreset) {
+    private func installMCP(_ preset: MCPPreset) {
         let targets = activeTargetAgents
         guard !targets.isEmpty else {
             state.statusIsError = true
@@ -838,7 +776,7 @@ struct ConnectionsSettingsTab: View {
                 DispatchQueue.main.async {
                     self.state.busyID = nil
                     self.state.statusIsError = false
-                    self.state.statusBanner = "Enabled \(preset.name) in \(names)."
+                    self.state.statusBanner = "Enabled \(preset.name) MCP in \(names)."
                     self.state.refreshStatus(config: self.configManager.config)
                 }
             } catch {
@@ -852,7 +790,7 @@ struct ConnectionsSettingsTab: View {
         }
     }
 
-    private func removeInstantTool(_ preset: MCPPreset) {
+    private func removeMCP(_ preset: MCPPreset) {
         state.busyID = "tool:\(preset.id)"
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -860,7 +798,7 @@ struct ConnectionsSettingsTab: View {
                 DispatchQueue.main.async {
                     self.state.busyID = nil
                     self.state.statusIsError = false
-                    self.state.statusBanner = "Removed \(preset.name) from all agents."
+                    self.state.statusBanner = "Removed \(preset.name) MCP from all agents."
                     self.state.refreshStatus(config: self.configManager.config)
                 }
             } catch {
@@ -872,113 +810,6 @@ struct ConnectionsSettingsTab: View {
                 }
             }
         }
-    }
-
-    private func importManualCLI(_ preset: ConnectionPreset) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let imported = try ConnectionsManager.shared.importFromHostCLI(connectionID: preset.id)
-                try ConnectionsManager.shared.saveToken(imported.token, for: preset.id)
-                if preset.id == "github" {
-                    _ = ConnectionsManager.shared.configureHostGitForGitHub(token: imported.token)
-                }
-                DispatchQueue.main.async {
-                    self.upsertConnectionMetadata(id: preset.id, envVar: preset.envVar, enabled: true, accountLabel: imported.label)
-                    self.configManager.onSyncLiveEnv?()
-                    self.state.statusIsError = false
-                    self.state.statusBanner = "Imported \(preset.name) into host vault."
-                    self.state.refreshStatus(config: self.configManager.config)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.state.statusIsError = true
-                    self.state.statusBanner = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    private func saveManualToken(_ preset: ConnectionPreset) {
-        let token = state.draftToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return }
-        do {
-            try ConnectionsManager.shared.saveToken(token, for: preset.id)
-            if preset.id == "github" {
-                _ = ConnectionsManager.shared.configureHostGitForGitHub(token: token)
-                configManager.config.sandboxAccess.allowHostGitConfig = true
-                configManager.config.sandboxAccess.shareGHConfig = true
-            }
-            upsertConnectionMetadata(id: preset.id, envVar: preset.envVar, enabled: true)
-            configManager.onSyncLiveEnv?()
-            state.draftToken = ""
-            state.editingAdvancedID = nil
-            state.statusIsError = false
-            state.statusBanner = "Saved \(preset.name) token in host vault."
-            state.refreshStatus(config: configManager.config)
-        } catch {
-            state.statusIsError = true
-            state.statusBanner = error.localizedDescription
-        }
-    }
-
-    private func removeManualToken(_ preset: ConnectionPreset) {
-        ConnectionsManager.shared.deleteToken(for: preset.id)
-        configManager.config.connections.accounts.removeAll { $0.id == preset.id }
-        configManager.onSyncLiveEnv?()
-        state.editingAdvancedID = nil
-        state.statusIsError = false
-        state.statusBanner = "Removed \(preset.name) token from host vault."
-        state.refreshStatus(config: configManager.config)
-    }
-
-    private func saveLLMKey(_ preset: VaultSecretEntry.Preset) {
-        let token = state.draftToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return }
-        var secrets = configManager.config.secretsNetwork.secrets
-        let entryID: UUID
-        if let idx = secrets.firstIndex(where: { $0.envVar == preset.envVar }) {
-            entryID = secrets[idx].id
-            secrets[idx].source = .keychain
-            secrets[idx].enabled = true
-        } else {
-            let newEntry = VaultSecretEntry(
-                envVar: preset.envVar,
-                source: .keychain,
-                allowedHosts: preset.allowedHosts,
-                baseURLVar: preset.baseURLVar,
-                baseURLPathPrefix: preset.baseURLPathPrefix,
-                enabled: true
-            )
-            entryID = newEntry.id
-            secrets.append(newEntry)
-        }
-        do {
-            try SecretsVaultManager.shared.saveKeychainSecret(token, for: entryID)
-        } catch {
-            state.statusIsError = true
-            state.statusBanner = "Could not store \(preset.label) key in Keychain: \(error.localizedDescription)"
-            return
-        }
-        configManager.config.secretsNetwork.proxyEnabled = true
-        configManager.config.secretsNetwork.secrets = secrets
-        state.draftToken = ""
-        state.editingLLMEnvVar = nil
-        state.statusIsError = false
-        state.statusBanner = "Connected \(preset.label) via Host Vault proxy (phantom token only inside sandboxes)."
-        state.refreshStatus(config: configManager.config)
-    }
-
-    private func removeLLMKey(_ preset: VaultSecretEntry.Preset) {
-        var secrets = configManager.config.secretsNetwork.secrets
-        if let idx = secrets.firstIndex(where: { $0.envVar == preset.envVar }) {
-            SecretsVaultManager.shared.deleteKeychainSecret(for: secrets[idx].id)
-            secrets.remove(at: idx)
-            configManager.config.secretsNetwork.secrets = secrets
-        }
-        state.editingLLMEnvVar = nil
-        state.statusIsError = false
-        state.statusBanner = "Removed \(preset.label) from Host Vault."
-        state.refreshStatus(config: configManager.config)
     }
 
     private func upsertConnectionMetadata(id: String, envVar: String, enabled: Bool, accountLabel: String? = nil) {

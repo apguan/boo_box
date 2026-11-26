@@ -282,9 +282,6 @@ final class OAuthFlowManager: @unchecked Sendable {
         switch preset.kind {
         case .githubOAuth:
             ConnectionsManager.shared.deleteToken(for: "github")
-            if let mcpID = preset.mcpID, let mcp = ConnectionsManager.mcpPreset(id: mcpID) {
-                try? ConnectionsManager.shared.removeMCP(mcp, from: MCPAgentTarget.allCases)
-            }
         case .mcpOAuthDCR(let mcpURL, _):
             deleteTokenRecord(serviceID: preset.id)
             removeOMPOAuthCredential(mcpURL: mcpURL)
@@ -471,12 +468,6 @@ final class OAuthFlowManager: @unchecked Sendable {
         if let imported = try? mgr.importFromHostCLI(connectionID: "github") {
             try mgr.saveToken(imported.token, for: "github")
             _ = mgr.configureHostGitForGitHub(token: imported.token)
-            if let ghMCP = ConnectionsManager.mcpPreset(id: "github") {
-                let agents = targetAgents.isEmpty ? mgr.detectInstalledAgents() : targetAgents
-                if !agents.isEmpty {
-                    try? mgr.installMCP(ghMCP, into: agents)
-                }
-            }
             let who = imported.label.isEmpty ? "" : " (\(imported.label))"
             return "Connected GitHub\(who) via host OAuth — wired git push & gh CLI across sandboxes."
         }
@@ -567,12 +558,6 @@ final class OAuthFlowManager: @unchecked Sendable {
         }
         try mgr.saveToken(imported.token, for: "github")
         _ = mgr.configureHostGitForGitHub(token: imported.token)
-        if let ghMCP = ConnectionsManager.mcpPreset(id: "github") {
-            let agents = targetAgents.isEmpty ? mgr.detectInstalledAgents() : targetAgents
-            if !agents.isEmpty {
-                try? mgr.installMCP(ghMCP, into: agents)
-            }
-        }
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -969,6 +954,43 @@ final class OAuthFlowManager: @unchecked Sendable {
             return sqlite3_column_int(stmt, 0) > 0
         }
         return false
+    }
+
+    /// Reads an existing OMP SQLite OAuth credential so `Sync All` can carry existing logins
+    /// (e.g. an already-authenticated Notion MCP) into OpenCode & host vault without re-auth.
+    func readOMPOAuthCredential(serviceID: String, mcpURL: String) -> OAuthTokenRecord? {
+        guard FileManager.default.fileExists(atPath: ompDBPath) else { return nil }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(ompDBPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else { return nil }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 1000)
+
+        var stmt: OpaquePointer?
+        let sql = "SELECT data FROM auth_credentials WHERE provider = ? AND credential_type = 'oauth' ORDER BY updated_at DESC LIMIT 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        let key = ompProviderKey(for: mcpURL)
+        sqlite3_bind_text(stmt, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(stmt) == SQLITE_ROW, let cStr = sqlite3_column_text(stmt, 0) else { return nil }
+        let jsonStr = String(cString: cStr)
+        guard let data = jsonStr.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let access = obj["access"] as? String, !access.isEmpty,
+              let clientID = obj["clientId"] as? String else { return nil }
+        let expiresSec: Double? = (obj["expires"] as? NSNumber).map { $0.doubleValue / 1000.0 }
+        return OAuthTokenRecord(
+            serviceID: serviceID,
+            resourceURL: (obj["resource"] as? String) ?? mcpURL,
+            accessToken: access,
+            refreshToken: obj["refresh"] as? String,
+            expiresAtEpochSeconds: expiresSec,
+            scope: obj["scope"] as? String,
+            clientID: clientID,
+            clientSecret: obj["clientSecret"] as? String,
+            authorizationURL: (obj["authorizationUrl"] as? String) ?? "",
+            tokenURL: (obj["tokenUrl"] as? String) ?? "",
+            connectedAt: Date()
+        )
     }
 
     func writeOMPOAuthCredential(record: OAuthTokenRecord) {
