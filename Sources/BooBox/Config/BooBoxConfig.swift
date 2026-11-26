@@ -275,6 +275,12 @@ struct PrivateVMConfig: Codable, Equatable, Sendable {
     var sharedHostPath: String = ""
     /// Mount optional VirtioFS folder read-only (recommended when sharing host files into a VM).
     var sharedHostReadOnly: Bool = true
+    /// Optional explicit Dockerfile / Containerfile path used to provision fresh Private Linux VMs.
+    var dockerfilePath: String = ""
+    /// Automatically detect `Dockerfile` / `Containerfile` inside `sharedHostPath` when `dockerfilePath` is empty.
+    var autoDetectDockerfile: Bool = true
+    /// Mount Dockerfile context directory strictly read-only during provisioning to satisfy `COPY` instructions (unmounted afterward if VM has no host share).
+    var dockerfileCopyContext: Bool = true
 
     static var defaultCPUCount: Int {
         let host = ProcessInfo.processInfo.processorCount
@@ -315,7 +321,10 @@ struct PrivateVMConfig: Codable, Equatable, Sendable {
         networkMode: PrivateVMNetworkMode = .nat,
         prewarmPool: Bool = true,
         sharedHostPath: String = "",
-        sharedHostReadOnly: Bool = true
+        sharedHostReadOnly: Bool = true,
+        dockerfilePath: String = "",
+        autoDetectDockerfile: Bool = true,
+        dockerfileCopyContext: Bool = true
     ) {
         self.cpuCount = cpuCount
         self.memoryMB = memoryMB
@@ -323,6 +332,9 @@ struct PrivateVMConfig: Codable, Equatable, Sendable {
         self.prewarmPool = prewarmPool
         self.sharedHostPath = sharedHostPath
         self.sharedHostReadOnly = sharedHostReadOnly
+        self.dockerfilePath = dockerfilePath
+        self.autoDetectDockerfile = autoDetectDockerfile
+        self.dockerfileCopyContext = dockerfileCopyContext
     }
 
     init(from decoder: Decoder) throws {
@@ -333,6 +345,9 @@ struct PrivateVMConfig: Codable, Equatable, Sendable {
         self.prewarmPool = try c.decodeIfPresent(Bool.self, forKey: .prewarmPool) ?? true
         self.sharedHostPath = try c.decodeIfPresent(String.self, forKey: .sharedHostPath) ?? ""
         self.sharedHostReadOnly = try c.decodeIfPresent(Bool.self, forKey: .sharedHostReadOnly) ?? true
+        self.dockerfilePath = try c.decodeIfPresent(String.self, forKey: .dockerfilePath) ?? ""
+        self.autoDetectDockerfile = try c.decodeIfPresent(Bool.self, forKey: .autoDetectDockerfile) ?? true
+        self.dockerfileCopyContext = try c.decodeIfPresent(Bool.self, forKey: .dockerfileCopyContext) ?? true
     }
 }
 
@@ -834,6 +849,9 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
     /// nil = inherit global; "" = explicitly air-gapped; non-empty = custom VirtioFS host folder
     var vmSharedHostPath: String? = nil
     var vmSharedHostReadOnly: Bool? = nil
+    /// nil = inherit global; "" = explicitly disabled; non-empty = custom Dockerfile/Containerfile path
+    var vmDockerfilePath: String? = nil
+    var vmDockerfileCopyContext: Bool? = nil
 
     static let `default` = SandboxOverrideConfig()
 
@@ -875,6 +893,8 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
             || vmNetworkMode != nil
             || vmSharedHostPath != nil
             || vmSharedHostReadOnly != nil
+            || vmDockerfilePath != nil
+            || vmDockerfileCopyContext != nil
             || !cleanedEnvVars.isEmpty
     }
 
@@ -886,6 +906,7 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
         if isLinuxVM {
             guard hasPrivateVMOverrides else { return nil }
             if vmNetworkMode == .offline { return "Offline" }
+            if let df = vmDockerfilePath, !df.isEmpty { return "Dockerfile" }
             if let c = vmCPUCount, let m = vmMemoryMB {
                 let mStr = m >= 1024 ? "\(m / 1024)G" : "\(m)M"
                 return "\(c)c·\(mStr)"
@@ -928,7 +949,9 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
         vmMemoryMB: Int? = nil,
         vmNetworkMode: PrivateVMNetworkMode? = nil,
         vmSharedHostPath: String? = nil,
-        vmSharedHostReadOnly: Bool? = nil
+        vmSharedHostReadOnly: Bool? = nil,
+        vmDockerfilePath: String? = nil,
+        vmDockerfileCopyContext: Bool? = nil
     ) {
         self.egressMode = egressMode
         self.extraAllowedDomains = extraAllowedDomains
@@ -950,8 +973,9 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
         self.vmNetworkMode = vmNetworkMode
         self.vmSharedHostPath = vmSharedHostPath
         self.vmSharedHostReadOnly = vmSharedHostReadOnly
+        self.vmDockerfilePath = vmDockerfilePath
+        self.vmDockerfileCopyContext = vmDockerfileCopyContext
     }
-
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.egressMode = try c.decodeIfPresent(EgressNetworkMode.self, forKey: .egressMode)
@@ -974,6 +998,8 @@ struct SandboxOverrideConfig: Codable, Equatable, Sendable {
         self.vmNetworkMode = try c.decodeIfPresent(PrivateVMNetworkMode.self, forKey: .vmNetworkMode)
         self.vmSharedHostPath = try c.decodeIfPresent(String.self, forKey: .vmSharedHostPath)
         self.vmSharedHostReadOnly = try c.decodeIfPresent(Bool.self, forKey: .vmSharedHostReadOnly)
+        self.vmDockerfilePath = try c.decodeIfPresent(String.self, forKey: .vmDockerfilePath)
+        self.vmDockerfileCopyContext = try c.decodeIfPresent(Bool.self, forKey: .vmDockerfileCopyContext)
     }
 }
 
@@ -1160,6 +1186,15 @@ struct BooBoxConfig: Codable, Equatable, Sendable {
         }
         if let ro = o.vmSharedHostReadOnly {
             copy.privateVM.sharedHostReadOnly = ro
+        }
+        if let dfPath = o.vmDockerfilePath {
+            copy.privateVM.dockerfilePath = dfPath
+            if dfPath.isEmpty {
+                copy.privateVM.autoDetectDockerfile = false
+            }
+        }
+        if let copyCtx = o.vmDockerfileCopyContext {
+            copy.privateVM.dockerfileCopyContext = copyCtx
         }
 
         return copy

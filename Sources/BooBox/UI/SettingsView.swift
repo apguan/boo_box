@@ -822,8 +822,118 @@ private struct SecretsNetworkSettingsTab: View {
 
 // MARK: - Private Linux MicroVM Tab
 
+@MainActor
+private final class PrivateVMUIState: ObservableObject {
+    @Published var showGeneratedScript = false
+}
+
+/// Shared live Dockerfile inspection preview used by Settings → Private VM and Per-VM Configuration.
+struct DockerfileInspectionPreview: View {
+    let parsed: ParsedDockerfile
+    let autoDetected: Bool
+    let copyContextEnabled: Bool
+    let isOffline: Bool
+    @Binding var showScript: Bool
+
+    private let vmBlue = Color(red: 0.38, green: 0.72, blue: 1.0)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(vmBlue)
+                Text(parsed.sourceURL.lastPathComponent)
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                Text(autoDetected ? "Auto-detected" : "Selected")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(vmBlue)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1.5)
+                    .background(Capsule().fill(vmBlue.opacity(0.14)))
+                Spacer()
+                Button(showScript ? "Hide Script" : "Preview Script") {
+                    showScript.toggle()
+                }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(vmBlue)
+            }
+
+            Text(parsed.summaryLine)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !parsed.baseRuntimePackages.isEmpty || parsed.installsBun {
+                let pkgs = parsed.baseRuntimePackages + (parsed.installsBun ? ["bun"] : [])
+                HStack(spacing: 5) {
+                    Image(systemName: "shippingbox")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color(red: 0.25, green: 0.84, blue: 0.72))
+                    Text("Alpine runtime auto-install: \(pkgs.joined(separator: ", "))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let cmd = parsed.defaultCommand, !cmd.isEmpty {
+                Text("CMD / ENTRYPOINT (saved to /root/.boobox-dockerfile-cmd): \(cmd)")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(2)
+            }
+
+            if !parsed.warnings.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(parsed.warnings, id: \.self) { warn in
+                        HStack(alignment: .top, spacing: 5) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                                .padding(.top, 1.5)
+                            Text(warn)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+
+            if showScript {
+                let ctxPoint = (parsed.requiresCopyContext && copyContextEnabled) ? "/mnt/context" : nil
+                let preview = parsed.generateProvisioningScript(contextMountPoint: ctxPoint, isOffline: isOffline)
+                ScrollView(.vertical) {
+                    Text(preview)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                }
+                .frame(maxHeight: 150)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.black.opacity(0.22))
+                )
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(vmBlue.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(vmBlue.opacity(0.20), lineWidth: 0.75)
+                )
+        )
+    }
+}
+
 private struct PrivateVMSettingsTab: View {
     @ObservedObject var configManager: BooBoxConfigManager
+    @StateObject private var uiState = PrivateVMUIState()
 
     private var memoryOptionsMB: [Int] {
         let maxMB = PrivateVMConfig.maxMemoryMB
@@ -831,11 +941,15 @@ private struct PrivateVMSettingsTab: View {
     }
 
     var body: some View {
-        ScrollView {
+        let vmCfg = configManager.config.privateVM
+        let resolvedDF = DockerfileParser.resolveDockerfile(for: vmCfg)
+        let parsedDF = resolvedDF.flatMap { try? DockerfileParser.parse(at: $0.url, contextDirectoryURL: $0.contextDir) }
+
+        return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 SettingsHeader(
                     title: "Private Linux MicroVM",
-                    subtitle: "Configure CPU, memory, networking, warm pool, and optional VirtioFS sharing for arm64 Linux microVMs (`⌘⌥N`). Changes apply to newly created VMs."
+                    subtitle: "Configure CPU, memory, networking, warm pool, Dockerfile setup, and optional VirtioFS sharing for arm64 Linux microVMs (`⇧⌘N`). Changes apply to newly created VMs."
                 )
 
                 SettingsCard(title: "Compute & Warm Pool") {
@@ -946,6 +1060,73 @@ private struct PrivateVMSettingsTab: View {
                         }
                     }
                 }
+
+                SettingsCard(title: "Dockerfile / Containerfile Setup") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Point to any Dockerfile / Containerfile (or let boo_box auto-detect one inside your shared folder) to automatically configure base runtimes, `ENV`, `WORKDIR`, `COPY`, and `RUN` steps on VM boot — zero Docker daemon required.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack(spacing: 8) {
+                            let displayLabel: String = {
+                                if !vmCfg.dockerfilePath.isEmpty { return vmCfg.dockerfilePath }
+                                if let resolvedDF {
+                                    return "Auto-detected: \(resolvedDF.url.path)"
+                                }
+                                return "None (default Alpine 3.21 arm64)"
+                            }()
+                            Text(displayLabel)
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle((vmCfg.dockerfilePath.isEmpty && resolvedDF == nil) ? .secondary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color.primary.opacity(0.06))
+                                )
+
+                            Button("Browse…") { pickDockerfile() }
+                                .controlSize(.small)
+
+                            if !vmCfg.dockerfilePath.isEmpty {
+                                Button("Clear") {
+                                    configManager.config.privateVM.dockerfilePath = ""
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+
+                        SettingsToggleRow(
+                            title: "Auto-detect Dockerfile in shared folder (/mnt/host)",
+                            subtitle: "Recognizes `Dockerfile`, `Containerfile`, `Dockerfile.dev`, `.devcontainer/Dockerfile`, and `docker/Dockerfile` when no explicit file is chosen.",
+                            isOn: $configManager.config.privateVM.autoDetectDockerfile
+                        )
+
+                        SettingsToggleRow(
+                            title: "Allow Read-Only COPY from Dockerfile directory",
+                            subtitle: "Temporarily mounts the Dockerfile's context folder strictly read-only during boot provisioning for `COPY` instructions, then unmounts it if the VM has no host share.",
+                            isOn: $configManager.config.privateVM.dockerfileCopyContext
+                        )
+
+                        if let parsedDF, let resolvedDF {
+                            DockerfileInspectionPreview(
+                                parsed: parsedDF,
+                                autoDetected: resolvedDF.autoDetected,
+                                copyContextEnabled: vmCfg.dockerfileCopyContext,
+                                isOffline: vmCfg.networkMode == .offline,
+                                showScript: $uiState.showGeneratedScript
+                            )
+                        } else if !vmCfg.dockerfilePath.isEmpty {
+                            Text("File not found or unreadable at \(vmCfg.dockerfilePath)")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
             }
             .padding(22)
         }
@@ -961,6 +1142,23 @@ private struct PrivateVMSettingsTab: View {
         let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
         let resolved = url.resolvingSymlinksInPath().path
         configManager.config.privateVM.sharedHostPath = resolved.hasPrefix(home + "/")
+            ? "~/" + String(resolved.dropFirst(home.count + 1))
+            : resolved
+    }
+
+    private func pickDockerfile() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Dockerfile or Containerfile for Private Linux VM"
+        panel.message = "Select a Dockerfile, Containerfile, or project directory containing one."
+        panel.prompt = "Select Dockerfile"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
+        let resolved = url.resolvingSymlinksInPath().path
+        configManager.config.privateVM.dockerfilePath = resolved.hasPrefix(home + "/")
             ? "~/" + String(resolved.dropFirst(home.count + 1))
             : resolved
     }

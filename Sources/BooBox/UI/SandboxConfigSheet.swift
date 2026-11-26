@@ -12,6 +12,7 @@ private enum SandboxJumpSection: String, Identifiable, Hashable {
     // Private Linux MicroVM sections (all rendered on one continuous page)
     case vmCompute = "Compute"
     case vmIsolation = "Network & Share"
+    case vmDockerfile = "Dockerfile"
     case vmEnvironment = "VM Environment"
 
     var id: String { rawValue }
@@ -25,6 +26,7 @@ private enum SandboxJumpSection: String, Identifiable, Hashable {
         case .resources: "gauge.with.dots.needle.50percent"
         case .vmCompute: "cpu"
         case .vmIsolation: "network"
+        case .vmDockerfile: "doc.text.magnifyingglass"
         case .vmEnvironment: "terminal"
         }
     }
@@ -37,7 +39,7 @@ private enum SandboxJumpSection: String, Identifiable, Hashable {
     }
 
     static let macSections: [SandboxJumpSection] = [.network, .secrets, .environment, .access, .resources]
-    static let vmSections: [SandboxJumpSection] = [.vmCompute, .vmIsolation, .vmEnvironment]
+    static let vmSections: [SandboxJumpSection] = [.vmCompute, .vmIsolation, .vmDockerfile, .vmEnvironment]
 }
 
 private enum TriStateOverride: String, CaseIterable, Identifiable {
@@ -96,6 +98,7 @@ private final class SandboxConfigDraftState: ObservableObject {
     @Published var newEnvKey = ""
     @Published var newEnvValue = ""
     @Published var newReadPath = ""
+    @Published var showDockerfileScript = false
 
     init(initial: SandboxOverrideConfig, isLinuxVM: Bool) {
         self.draft = initial
@@ -188,6 +191,8 @@ struct SandboxConfigSheet: View {
             return state.draft.vmCPUCount != nil || state.draft.vmMemoryMB != nil
         case .vmIsolation:
             return state.draft.vmNetworkMode != nil || state.draft.vmSharedHostPath != nil || state.draft.vmSharedHostReadOnly != nil
+        case .vmDockerfile:
+            return state.draft.vmDockerfilePath != nil || state.draft.vmDockerfileCopyContext != nil
         case .vmEnvironment:
             return !state.draft.cleanedEnvVars.isEmpty
         }
@@ -213,6 +218,7 @@ struct SandboxConfigSheet: View {
                             if isLinuxVM {
                                 sectionAnchor(.vmCompute) { vmComputeCard }
                                 sectionAnchor(.vmIsolation) { vmNetworkAndShareCard }
+                                sectionAnchor(.vmDockerfile) { vmDockerfileCard }
                                 sectionAnchor(.vmEnvironment) {
                                     envVarsCard(subtitle: "Injected into /root/.boobox-env.sh (0600) on VM boot. Reboot VM to apply.")
                                 }
@@ -840,6 +846,77 @@ struct SandboxConfigSheet: View {
         }
     }
 
+    private var vmDockerfileCard: some View {
+        let effectiveCfg = configManager.config.applying(overrides: state.draft).privateVM
+        let resolvedDF = DockerfileParser.resolveDockerfile(for: effectiveCfg)
+        let parsedDF = resolvedDF.flatMap { try? DockerfileParser.parse(at: $0.url, contextDirectoryURL: $0.contextDir) }
+
+        let choiceBinding = Binding<VMShareChoice>(
+            get: {
+                guard let path = state.draft.vmDockerfilePath else { return .inherit }
+                return path.isEmpty ? .none : .custom
+            },
+            set: { choice in
+                switch choice {
+                case .inherit: state.draft.vmDockerfilePath = nil
+                case .none: state.draft.vmDockerfilePath = ""
+                case .custom:
+                    if (state.draft.vmDockerfilePath ?? "").isEmpty {
+                        pickVMDockerfile()
+                    }
+                }
+            }
+        )
+
+        return sheetCard(title: "Dockerfile / Containerfile Setup") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Automatically parses `FROM`, `ARG`, `ENV`, `WORKDIR`, `COPY`, and `RUN` instructions when booting or resetting this Private VM.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Picker("", selection: choiceBinding) {
+                    Text("Inherit Global").tag(VMShareChoice.inherit)
+                    Text("Disabled").tag(VMShareChoice.none)
+                    Text("Custom Dockerfile").tag(VMShareChoice.custom)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                if let customPath = state.draft.vmDockerfilePath, !customPath.isEmpty {
+                    HStack(spacing: 8) {
+                        Text(customPath)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+                        Button("Change…") { pickVMDockerfile() }
+                            .controlSize(.small)
+                    }
+                }
+
+                triStateRow(
+                    title: "Allow Read-Only COPY context",
+                    subtitle: "Global: \(configManager.config.privateVM.dockerfileCopyContext ? "Enabled" : "Disabled")",
+                    optionalBool: $state.draft.vmDockerfileCopyContext
+                )
+
+                if let parsedDF, let resolvedDF {
+                    DockerfileInspectionPreview(
+                        parsed: parsedDF,
+                        autoDetected: resolvedDF.autoDetected,
+                        copyContextEnabled: effectiveCfg.dockerfileCopyContext,
+                        isOffline: effectiveCfg.networkMode == .offline,
+                        showScript: $state.showDockerfileScript
+                    )
+                }
+            }
+        }
+    }
+
     // MARK: - Shared Env Vars Card
 
     private func envVarsCard(subtitle: String) -> some View {
@@ -1001,6 +1078,22 @@ struct SandboxConfigSheet: View {
         let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
         let resolved = url.resolvingSymlinksInPath().path
         state.draft.vmSharedHostPath = resolved.hasPrefix(home + "/")
+            ? "~/" + String(resolved.dropFirst(home.count + 1))
+            : resolved
+    }
+
+    private func pickVMDockerfile() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Dockerfile or Containerfile for This Private VM"
+        panel.prompt = "Select Dockerfile"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
+        let resolved = url.resolvingSymlinksInPath().path
+        state.draft.vmDockerfilePath = resolved.hasPrefix(home + "/")
             ? "~/" + String(resolved.dropFirst(home.count + 1))
             : resolved
     }

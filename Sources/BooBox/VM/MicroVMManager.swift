@@ -62,6 +62,9 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
     private(set) var isReady = false
     private let overrides: SandboxOverrideConfig
     private var hasSharedHostMount = false
+    private var hasSeparateDockerfileContextMount = false
+    private var dockerfileContextUsesHostShare = false
+    private var parsedDockerfile: ParsedDockerfile?
     private var isOfflineMode = false
     private(set) var currentState: VMState = .booting
     var onStateChange: (@MainActor @Sendable (VMState) -> Void)?
@@ -149,16 +152,43 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
             cfg.networkDevices = []
         }
 
-        // Optional opted-in VirtioFS host folder share (mounted at /mnt/host inside Linux guest)
-        if let sharedURL = vmCfg.resolvedSharedHostURL {
+        // Resolve optional Dockerfile / Containerfile (explicit or auto-detected inside sharedHostPath)
+        var resolvedDockerfile: ParsedDockerfile? = nil
+        if let found = DockerfileParser.resolveDockerfile(for: vmCfg),
+           let parsed = try? DockerfileParser.parse(at: found.url, contextDirectoryURL: found.contextDir) {
+            resolvedDockerfile = parsed
+        }
+        self.parsedDockerfile = resolvedDockerfile
+
+        // VirtioFS shares: optional host folder (/mnt/host) + optional temporary read-only Dockerfile COPY context (/mnt/context)
+        var fsDevices: [VZDirectorySharingDeviceConfiguration] = []
+        let sharedURL = vmCfg.resolvedSharedHostURL
+        if let sharedURL {
             let fsDevice = VZVirtioFileSystemDeviceConfiguration(tag: "boobox_host")
             let sharedDir = VZSharedDirectory(url: sharedURL, readOnly: vmCfg.sharedHostReadOnly)
             fsDevice.share = VZSingleDirectoryShare(directory: sharedDir)
-            cfg.directorySharingDevices = [fsDevice]
+            fsDevices.append(fsDevice)
             self.hasSharedHostMount = true
         } else {
             self.hasSharedHostMount = false
         }
+
+        self.hasSeparateDockerfileContextMount = false
+        self.dockerfileContextUsesHostShare = false
+        if let parsed = resolvedDockerfile, parsed.requiresCopyContext, vmCfg.dockerfileCopyContext {
+            let ctxURL = parsed.contextDirectoryURL.resolvingSymlinksInPath()
+            if let sharedURL, sharedURL.resolvingSymlinksInPath().path == ctxURL.path {
+                self.dockerfileContextUsesHostShare = true
+            } else {
+                let ctxDevice = VZVirtioFileSystemDeviceConfiguration(tag: "boobox_dfctx")
+                // Strictly read-only, unmounted right after Dockerfile COPY provisioning completes
+                let ctxDir = VZSharedDirectory(url: ctxURL, readOnly: true)
+                ctxDevice.share = VZSingleDirectoryShare(directory: ctxDir)
+                fsDevices.append(ctxDevice)
+                self.hasSeparateDockerfileContextMount = true
+            }
+        }
+        cfg.directorySharingDevices = fsDevices
         // Entropy device
         cfg.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
@@ -233,13 +263,14 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
         }
     }
 
-    /// Runs configured startup script and optional opted-in env vars inside a fresh Private VM
-    /// over an internal vsock session (zero host filesystem mounts required).
+    /// Runs configured Dockerfile setup, custom startup script, and optional opted-in env vars
+    /// inside a fresh Private VM over an internal vsock session.
     private func runConfiguredProvisioningIfNeeded() {
         let setup = BooBoxConfigManager.currentSnapshot().applying(overrides: overrides).ephemeralSetup
         let customScript = setup.privateVMSetupScript.trimmingCharacters(in: .whitespacesAndNewlines)
         let vmEnvVars = setup.injectEnvIntoPrivateVM ? setup.cleanedEnvVars : []
-        guard hasSharedHostMount || !customScript.isEmpty || !vmEnvVars.isEmpty else { return }
+        let dockerfile = parsedDockerfile
+        guard hasSharedHostMount || dockerfile != nil || !customScript.isEmpty || !vmEnvVars.isEmpty else { return }
 
         var scriptLines: [String] = [
             "#!/bin/sh",
@@ -248,6 +279,9 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
         ]
         if hasSharedHostMount {
             scriptLines.append("mkdir -p /mnt/host && mount -t virtiofs boobox_host /mnt/host 2>/dev/null || true")
+        }
+        if hasSeparateDockerfileContextMount {
+            scriptLines.append("mkdir -p /mnt/context && mount -t virtiofs boobox_dfctx /mnt/context -o ro 2>/dev/null || mount -t virtiofs boobox_dfctx /mnt/context 2>/dev/null || true")
         }
         if !vmEnvVars.isEmpty {
             let envBody = vmEnvVars.map { pair in
@@ -259,10 +293,25 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
             scriptLines.append("grep -q '.boobox-env.sh' /root/.zshrc 2>/dev/null || printf '\\n[ -f /root/.boobox-env.sh ] && source /root/.boobox-env.sh\\n' >> /root/.zshrc")
             scriptLines.append(". /root/.boobox-env.sh")
         }
-        if !customScript.isEmpty {
-            if !isOfflineMode {
-                scriptLines.append("for i in 1 2 3 4 5 6 7 8 9 10 11 12; do ip route 2>/dev/null | grep -q default && break; sleep 0.4; done")
+        if !isOfflineMode && (dockerfile != nil || !customScript.isEmpty) {
+            scriptLines.append("for i in 1 2 3 4 5 6 7 8 9 10 11 12; do ip route 2>/dev/null | grep -q default && break; sleep 0.4; done")
+        }
+        if let dockerfile {
+            let ctxPoint: String?
+            if hasSeparateDockerfileContextMount {
+                ctxPoint = "/mnt/context"
+            } else if dockerfileContextUsesHostShare {
+                ctxPoint = "/mnt/host"
+            } else {
+                ctxPoint = nil
             }
+            scriptLines.append(dockerfile.generateProvisioningScript(contextMountPoint: ctxPoint, isOffline: isOfflineMode))
+        }
+        if hasSeparateDockerfileContextMount {
+            // Immediately unmount temporary read-only COPY context so air-gapped VMs retain zero host mounts
+            scriptLines.append("cd /root && (umount /mnt/context 2>/dev/null || umount -l /mnt/context 2>/dev/null || true) && rmdir /mnt/context 2>/dev/null || true")
+        }
+        if !customScript.isEmpty {
             scriptLines.append(customScript)
         }
         scriptLines.append("touch /var/lib/boobox-setup.done")
