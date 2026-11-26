@@ -21,6 +21,9 @@ Global Sandbox Environment (~/boo_box/env — shared across all sessions):
   boo env rm <dir-path>       Remove a toolchain directory inside ~/boo_box/env
   boo env path                Print the global sandbox env root path
   boo env reset               Wipe and recreate ~/boo_box/env cleanly
+
+Integrations:
+  boo setup-github            One-time Keychain Git + GitHub setup (--token, --from-gh, --status, --remove)
   boo -h, --help              Show this help
 EOF
 }
@@ -71,7 +74,7 @@ url_encode() {
     printf '%s' "$out"
 }
 
-# Route global sandbox environment subcommands directly to boobox-env
+# Route global sandbox environment & setup subcommands
 case "${1:-}" in
     install|run|tools|ls|list|env)
         APP_PATH="$(resolve_app)"
@@ -81,6 +84,16 @@ case "${1:-}" in
             ENV_BIN="$SCRIPT_DIR/boobox-env"
         fi
         exec "$ENV_BIN" "$@"
+        ;;
+    setup-github)
+        shift
+        APP_PATH="$(resolve_app)"
+        SETUP_BIN="$APP_PATH/Contents/Resources/bin/boobox-setup-github"
+        if [ ! -x "$SETUP_BIN" ]; then
+            SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+            SETUP_BIN="$SCRIPT_DIR/boobox-setup-github"
+        fi
+        exec "$SETUP_BIN" "$@"
         ;;
 esac
 NO_ENV=0

@@ -38,7 +38,10 @@ if [ -f "$ROOT/scripts/boobox-env" ]; then
     cp "$ROOT/scripts/boobox-env" "$APP_BUNDLE/Contents/Resources/bin/boobox-env"
     chmod +x "$APP_BUNDLE/Contents/Resources/bin/boobox-env"
 fi
-
+if [ -f "$ROOT/scripts/boobox-setup-github" ]; then
+    cp "$ROOT/scripts/boobox-setup-github" "$APP_BUNDLE/Contents/Resources/bin/boobox-setup-github"
+    chmod +x "$APP_BUNDLE/Contents/Resources/bin/boobox-setup-github"
+fi
 # Bundle version-matched Ghostty 1.4.0 terminfo & shell integration
 GHOSTTY_RES="/Applications/Ghostty.app/Contents/Resources"
 if [ -d "$GHOSTTY_RES/terminfo" ]; then

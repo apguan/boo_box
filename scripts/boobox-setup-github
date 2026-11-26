@@ -1,0 +1,245 @@
+#!/bin/bash
+# boobox-setup-github: One-time reproducible Git + GitHub setup for all boo_box sandboxes.
+#
+# Zero plaintext tokens in config.json! Stores GH_TOKEN encrypted in macOS Keychain
+# (`dev.boo-box.connections`, account `github`), configures host ~/.gitconfig
+# (`user.name`, `user.email`, `gh auth setup-git`), enables the connection in
+# ~/boo_box/config.json, and live-reloads running boo_box.app via ~/boo_box/run/app.sock.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+boo setup-github — One-time Keychain-backed Git + GitHub setup for all boo_box sandboxes
+
+Usage:
+  boo setup-github                    Interactive setup (paste fine-grained PAT or reuse host `gh` login)
+  boo setup-github --token <pat>      Store a fine-grained GitHub PAT in macOS Keychain (recommended)
+  boo setup-github --from-gh          One-shot non-interactive import from your host `gh auth token`
+  boo setup-github --from-env         Read token from $GH_TOKEN in your current shell
+  boo setup-github --status           Show current GitHub sandbox configuration status
+  boo setup-github --remove           Delete GitHub token from macOS Keychain & disable connection
+  boo setup-github --name <name>      Explicitly set global git user.name (optional)
+  boo setup-github --email <email>    Explicitly set global git user.email (optional)
+  boo setup-github -h, --help         Show this help
+EOF
+}
+
+KEYCHAIN_SERVICE="dev.boo-box.connections"
+KEYCHAIN_ACCOUNT="github"
+CONFIG_PATH="$HOME/boo_box/config.json"
+SOCK_PATH="$HOME/boo_box/run/app.sock"
+
+MODE="interactive"
+TOKEN=""
+EXPLICIT_NAME=""
+EXPLICIT_EMAIL=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --from-gh) MODE="from-gh"; shift ;;
+        --from-env) MODE="from-env"; shift ;;
+        --token)
+            [ $# -ge 2 ] || { echo "boo setup-github: --token requires a value" >&2; exit 2; }
+            MODE="token"; TOKEN="$2"; shift 2 ;;
+        --status) MODE="status"; shift ;;
+        --remove|--revoke) MODE="remove"; shift ;;
+        --name)
+            [ $# -ge 2 ] || { echo "boo setup-github: --name requires a value" >&2; exit 2; }
+            EXPLICIT_NAME="$2"; shift 2 ;;
+        --email)
+            [ $# -ge 2 ] || { echo "boo setup-github: --email requires a value" >&2; exit 2; }
+            EXPLICIT_EMAIL="$2"; shift 2 ;;
+        *)
+            echo "boo setup-github: unknown argument: $1" >&2
+            usage >&2
+            exit 2 ;;
+    esac
+done
+
+GH_BIN="$(command -v gh 2>/dev/null || true)"
+if [ -z "$GH_BIN" ] && [ -x "/opt/homebrew/bin/gh" ]; then GH_BIN="/opt/homebrew/bin/gh"; fi
+if [ -z "$GH_BIN" ] && [ -x "/usr/local/bin/gh" ]; then GH_BIN="/usr/local/bin/gh"; fi
+
+notify_running_app_reload() {
+    [ -S "$SOCK_PATH" ] || return 0
+    python3 - "$SOCK_PATH" <<'PY' 2>/dev/null || true
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1.5)
+s.connect(sys.argv[1])
+s.sendall(b'{"op":"reload_config"}\n')
+s.shutdown(socket.SHUT_WR)
+s.recv(64)
+s.close()
+PY
+}
+
+if [ "$MODE" = "status" ]; then
+    GIT_NAME="$(git config --global --get user.name 2>/dev/null || true)"
+    GIT_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
+    GIT_CRED="$(git config --global --get-all credential.https://github.com.helper 2>/dev/null | tr '\n' ' ' || true)"
+    KC_HAS="no"
+    if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1; then
+        KC_HAS="yes (encrypted in macOS Keychain)"
+    fi
+    echo "Git user.name          : ${GIT_NAME:-<unset>}"
+    echo "Git user.email         : ${GIT_EMAIL:-<unset>}"
+    echo "GitHub HTTPS helper    : ${GIT_CRED:-<unset>}"
+    echo "Keychain GitHub token  : $KC_HAS"
+    python3 - "$CONFIG_PATH" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("boo_box config.json    : <not yet created>")
+    sys.exit(0)
+cfg = json.load(open(p))
+allow_git = cfg.get("sandboxAccess", {}).get("allowHostGitConfig", False)
+share_gh = cfg.get("sandboxAccess", {}).get("shareGHConfig", True)
+accts = cfg.get("connections", {}).get("accounts", [])
+gh = next((a for a in accts if a.get("id") == "github"), None)
+print(f"allowHostGitConfig     : {allow_git}")
+print(f"shareGHConfig          : {share_gh}")
+print(f"Connection enabled     : {bool(gh and gh.get('enabled', False))} (label={gh.get('accountLabel') if gh else None})")
+PY
+    exit 0
+fi
+
+if [ "$MODE" = "remove" ]; then
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" >/dev/null 2>&1 || true
+    python3 - "$CONFIG_PATH" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+if not os.path.exists(p):
+    sys.exit(0)
+cfg = json.load(open(p))
+conns = cfg.setdefault("connections", {})
+conns["accounts"] = [a for a in conns.get("accounts", []) if a.get("id") != "github"]
+ephem = cfg.setdefault("ephemeralSetup", {})
+ephem["envVars"] = [e for e in ephem.get("envVars", []) if e.get("key") != "GH_TOKEN"]
+tmp = p + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)
+PY
+    notify_running_app_reload
+    echo "Removed GitHub token from macOS Keychain and boo_box config."
+    exit 0
+fi
+
+# 1. Resolve token
+if [ "$MODE" = "from-gh" ]; then
+    [ -n "$GH_BIN" ] || { echo "boo setup-github: 'gh' CLI not found. Install via 'brew install gh' or pass --token <pat>." >&2; exit 1; }
+    TOKEN="$("$GH_BIN" auth token 2>/dev/null || true)"
+    [ -n "$TOKEN" ] || { echo "boo setup-github: host 'gh' is not authenticated. Run 'gh auth login' first or pass --token <pat>." >&2; exit 1; }
+elif [ "$MODE" = "from-env" ]; then
+    TOKEN="${GH_TOKEN:-}"
+    [ -n "$TOKEN" ] || { echo "boo setup-github: GH_TOKEN is not set in environment." >&2; exit 1; }
+elif [ "$MODE" = "interactive" ]; then
+    HOST_GH_TOK=""
+    [ -n "$GH_BIN" ] && HOST_GH_TOK="$("$GH_BIN" auth token 2>/dev/null || true)"
+    echo "boo_box — One-Time GitHub Setup (stored in macOS Keychain, zero plaintext in config.json)"
+    echo "  Recommended: create a repo-scoped Fine-Grained PAT (Contents + Pull requests RW):"
+    echo "    https://github.com/settings/personal-access-tokens/new"
+    echo ""
+    if [ -n "$HOST_GH_TOK" ]; then
+        printf "Paste fine-grained PAT (or press Enter to reuse your current host 'gh' login): "
+    else
+        printf "Paste your GitHub Personal Access Token (github_pat_...): "
+    fi
+    IFS= read -r -s INPUT_TOK || true
+    echo ""
+    if [ -n "$INPUT_TOK" ]; then
+        TOKEN="$INPUT_TOK"
+    elif [ -n "$HOST_GH_TOK" ]; then
+        TOKEN="$HOST_GH_TOK"
+        echo "Reusing current host 'gh' CLI token."
+    else
+        echo "boo setup-github: no token provided." >&2
+        exit 1
+    fi
+fi
+
+TOKEN="$(printf '%s' "$TOKEN" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+[ -n "$TOKEN" ] || { echo "boo setup-github: empty token." >&2; exit 1; }
+
+# 2. Configure host ~/.gitconfig (user.name, user.email, gh auth setup-git)
+CUR_NAME="$(git config --global --get user.name 2>/dev/null || true)"
+CUR_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
+GH_USER_JSON=""
+GH_LOGIN=""
+if [ -n "$GH_BIN" ]; then
+    GH_USER_JSON="$(GH_TOKEN="$TOKEN" "$GH_BIN" api user 2>/dev/null || true)"
+    if [ -n "$GH_USER_JSON" ]; then
+        GH_LOGIN="$(python3 -c 'import json,sys; print((json.loads(sys.argv[1]).get("login") or "").strip())' "$GH_USER_JSON" 2>/dev/null || true)"
+    fi
+fi
+
+if [ -n "$EXPLICIT_NAME" ]; then
+    git config --global user.name "$EXPLICIT_NAME"; CUR_NAME="$EXPLICIT_NAME"
+elif [ -z "$CUR_NAME" ]; then
+    INFERRED_NAME=""
+    if [ -n "$GH_USER_JSON" ]; then
+        INFERRED_NAME="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print((d.get("name") or d.get("login") or "").strip())' "$GH_USER_JSON" 2>/dev/null || true)"
+    fi
+    [ -n "$INFERRED_NAME" ] || INFERRED_NAME="$(id -F 2>/dev/null || true)"
+    if [ -n "$INFERRED_NAME" ]; then
+        git config --global user.name "$INFERRED_NAME"; CUR_NAME="$INFERRED_NAME"
+    fi
+fi
+
+if [ -n "$EXPLICIT_EMAIL" ]; then
+    git config --global user.email "$EXPLICIT_EMAIL"; CUR_EMAIL="$EXPLICIT_EMAIL"
+elif [ -z "$CUR_EMAIL" ] && [ -n "$GH_USER_JSON" ]; then
+    INFERRED_EMAIL="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); em=d.get("email"); print(em if em else f"{d[\"id\"]}+{d[\"login\"]}@users.noreply.github.com" if d.get("id") and d.get("login") else "")' "$GH_USER_JSON" 2>/dev/null || true)"
+    if [ -n "$INFERRED_EMAIL" ]; then
+        git config --global user.email "$INFERRED_EMAIL"; CUR_EMAIL="$INFERRED_EMAIL"
+    fi
+fi
+
+if [ -n "$GH_BIN" ]; then
+    GH_TOKEN="$TOKEN" "$GH_BIN" auth setup-git >/dev/null 2>&1 || true
+fi
+
+# 3. Store token encrypted in macOS Keychain (never plaintext in config.json!)
+security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$TOKEN" >/dev/null
+
+# 4. Enable connection metadata in ~/boo_box/config.json (0600)
+mkdir -p "$HOME/boo_box"
+BOOBOX_GH_LABEL="${GH_LOGIN:-PAT}" python3 - "$CONFIG_PATH" <<'PY'
+import json, os, sys
+
+cfg_path = sys.argv[1]
+label = os.environ.get("BOOBOX_GH_LABEL") or "Keychain"
+cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {"version": 1}
+
+access = cfg.setdefault("sandboxAccess", {})
+access["allowHostGitConfig"] = True
+access["shareGHConfig"] = True
+
+conns = cfg.setdefault("connections", {})
+accts = [a for a in conns.get("accounts", []) if a.get("id") != "github"]
+accts.append({"id": "github", "enabled": True, "envVar": "GH_TOKEN", "accountLabel": label})
+conns["accounts"] = accts
+
+# Clean any legacy plaintext GH_TOKEN from ephemeralSetup.envVars
+if "ephemeralSetup" in cfg and "envVars" in cfg["ephemeralSetup"]:
+    cfg["ephemeralSetup"]["envVars"] = [e for e in cfg["ephemeralSetup"]["envVars"] if e.get("key") != "GH_TOKEN"]
+
+tmp_path = cfg_path + ".tmp"
+with open(tmp_path, "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.chmod(tmp_path, 0o600)
+os.replace(tmp_path, cfg_path)
+PY
+
+notify_running_app_reload
+
+echo "GitHub configured for all future boo_box sandboxes:"
+echo "  Git identity  : ${CUR_NAME:-<unset>} <${CUR_EMAIL:-<unset>}>"
+echo "  Token storage : macOS Keychain ($KEYCHAIN_SERVICE / $KEYCHAIN_ACCOUNT) — 0 plaintext in config.json"
+echo "  Host config   : allowHostGitConfig=true, shareGHConfig=true, gh auth setup-git applied"
+echo "  Note          : New tabs pick this up immediately; hit 'Save & Restart' (⌥⌘,) on already-open tabs."
