@@ -57,7 +57,8 @@ else
     echo "WARNING: Resources/vm assets missing; run ./scripts/build-guest-image.sh first" >&2
 fi
 
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
+GIT_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "")"
+cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -82,6 +83,10 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <string>0.2.0</string>
     <key>CFBundleVersion</key>
     <string>2</string>
+    <key>BooBoxGitRepo</key>
+    <string>apguan/boo_box</string>
+    <key>BooBoxGitCommit</key>
+    <string>${GIT_COMMIT}</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>NSHighResolutionCapable</key>
@@ -126,6 +131,7 @@ codesign --force --sign - --entitlements "$ROOT/Resources/boo_box.entitlements" 
 # Record built app path for portable `boo` CLI lookup & install/update `~/.local/bin/boo`
 mkdir -p "$HOME/boo_box"
 printf '%s\n' "$APP_BUNDLE" > "$HOME/boo_box/.app-path"
+printf '%s\n' "$ROOT" > "$HOME/boo_box/.repo-path"
 if [ -f "$ROOT/scripts/boo" ]; then
     mkdir -p "$HOME/.local/bin"
     cp "$ROOT/scripts/boo" "$HOME/.local/bin/boo"

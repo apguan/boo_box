@@ -142,13 +142,14 @@ struct SettingsView: View {
 
 private struct GeneralSettingsTab: View {
     @ObservedObject var configManager: BooBoxConfigManager
+    @ObservedObject private var updateManager = UpdateManager.shared
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 SettingsHeader(
                     title: "General",
-                    subtitle: "Session naming, safety prompts, and config file management."
+                    subtitle: "Semantic session naming, auto-updates, safety prompts, and config management."
                 )
 
                 SettingsCard(title: "Sessions") {
@@ -172,6 +173,87 @@ private struct GeneralSettingsTab: View {
                         subtitle: "Shows a dismissible prompt when clicking http(s) links inside sandboxed tabs (non-web URL schemes always ask). Re-enable here if you checked \"Don't ask again\".",
                         isOn: $configManager.config.general.confirmOpeningWebLinks
                     )
+                }
+
+                SettingsCard(title: "Updates (\(updateManager.repoSlug))") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        SettingsToggleRow(
+                            title: "Automatically check for updates",
+                            subtitle: "Checks github.com/\(updateManager.repoSlug) on launch and every 6 hours. Turn off to disable all automatic update checks.",
+                            isOn: $configManager.config.general.autoUpdateEnabled
+                        )
+
+                        Divider()
+
+                        SettingsToggleRow(
+                            title: "Auto-download verified release updates",
+                            subtitle: "When a signed GitHub Release .zip is published, download and stage it automatically. Local main-branch updates always ask first.",
+                            isOn: $configManager.config.general.autoDownloadUpdates
+                        )
+                        .disabled(!configManager.config.general.autoUpdateEnabled)
+                        .opacity(configManager.config.general.autoUpdateEnabled ? 1 : 0.5)
+
+                        Divider()
+
+                        HStack(spacing: 8) {
+                            let commitBadge = updateManager.currentCommit.isEmpty
+                                ? "v\(updateManager.currentVersion)"
+                                : "v\(updateManager.currentVersion) · \(updateManager.currentCommit)"
+                            Text(commitBadge)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color.primary.opacity(0.06))
+                                )
+
+                            updateStatusBadge
+
+                            Spacer()
+
+                            Button("GitHub") {
+                                NSWorkspace.shared.open(updateManager.repoURL)
+                            }
+                            .controlSize(.small)
+
+                            if case .available(let update) = updateManager.state {
+                                Button(update.installButtonTitle) {
+                                    updateManager.installAvailableUpdate()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+
+                            Button("Check Now") {
+                                updateManager.checkForUpdates(userInitiated: true)
+                            }
+                            .controlSize(.small)
+                            .disabled(isUpdateBusy)
+                        }
+
+                        if case .downloading(let progress, let version) = updateManager.state {
+                            ProgressView(value: progress) {
+                                Text("Downloading \(version) (\(Int(progress * 100))%)…")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .controlSize(.small)
+                        } else if case .installing(let msg) = updateManager.state {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.mini)
+                                Text(msg)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if case .error(let msg) = updateManager.state {
+                            Text(msg)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.red)
+                                .textSelection(.enabled)
+                        }
+                    }
                 }
 
                 SettingsCard(title: "Project Cloning (boo <dir>)") {
@@ -234,6 +316,50 @@ private struct GeneralSettingsTab: View {
                 }
             }
             .padding(22)
+        }
+    }
+
+    private var isUpdateBusy: Bool {
+        switch updateManager.state {
+        case .checking, .downloading, .installing: return true
+        default: return false
+        }
+    }
+
+    @ViewBuilder
+    private var updateStatusBadge: some View {
+        switch updateManager.state {
+        case .idle:
+            Text(configManager.config.general.autoUpdateEnabled ? "Auto-update on" : "Auto-update off")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        case .checking:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("Checking…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        case .upToDate(let date):
+            Text("Up to date · \(date.formatted(date: .omitted, time: .shortened))")
+                .font(.system(size: 11))
+                .foregroundStyle(.green)
+        case .available(let update):
+            Text("Update available: \(update.version)")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+        case .downloading(_, let version):
+            Text("Downloading \(version)…")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.accentColor)
+        case .installing:
+            Text("Installing…")
+                .font(.system(size: 11))
+                .foregroundStyle(Color.accentColor)
+        case .error:
+            Text("Check failed")
+                .font(.system(size: 11))
+                .foregroundStyle(.red)
         }
     }
 }

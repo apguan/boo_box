@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MainWorkspaceView: View {
     @ObservedObject var store: SessionStore
+    @ObservedObject private var updateManager = UpdateManager.shared
 
     var body: some View {
         HStack(spacing: 0) {
@@ -52,6 +53,14 @@ struct MainWorkspaceView: View {
                 )
             }
 
+            if updateManager.shouldShowBanner, case .available(let update) = updateManager.state {
+                UpdateAvailableBanner(update: update, updateManager: updateManager)
+            } else if case .downloading(let progress, let version) = updateManager.state {
+                UpdateProgressBanner(text: "Downloading boo_box \(version) (\(Int(progress * 100))%)…")
+            } else if case .installing(let message) = updateManager.state {
+                UpdateProgressBanner(text: message)
+            }
+
             ZStack {
                 TerminalStageRepresentable(stageView: store.stageView)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,6 +78,68 @@ struct MainWorkspaceView: View {
                     .strokeBorder(Color(red: 1.0, green: 0.34, blue: 0.32).opacity(0.65), lineWidth: 1.5)
                     .allowsHitTesting(false)
             }
+        }
+    }
+}
+
+private struct UpdateAvailableBanner: View {
+    let update: AvailableUpdate
+    @ObservedObject var updateManager: UpdateManager
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(Color.accentColor)
+            Text("boo_box \(update.version) is available from \(updateManager.repoSlug)")
+                .font(.system(size: 11.5, weight: .medium))
+                .lineLimit(1)
+            Spacer()
+            Button("Notes") {
+                NSWorkspace.shared.open(update.htmlURL)
+            }
+            .buttonStyle(.borderless)
+            .font(.system(size: 11))
+            Button(update.installButtonTitle) {
+                updateManager.installAvailableUpdate()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+            Button {
+                updateManager.dismissBanner(for: update.version)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss until next launch")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.10))
+        .overlay(alignment: .bottom) {
+            Divider().opacity(0.4)
+        }
+    }
+}
+
+private struct UpdateProgressBanner: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.mini)
+            Text(text)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.08))
+        .overlay(alignment: .bottom) {
+            Divider().opacity(0.4)
         }
     }
 }

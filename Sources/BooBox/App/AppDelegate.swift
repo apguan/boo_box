@@ -20,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Start host-side secret vault / egress proxy sidecar before launching sessions
         _ = SecretsVaultManager.shared.startIfNeeded()
 
+        // Schedule automatic GitHub update checks from `apguan/boo_box` if enabled in Settings
+        UpdateManager.shared.startIfEnabled()
 
         do {
             try GhosttyRuntime.shared.start()
@@ -282,6 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu(title: "boo_box")
         appMenu.addItem(withTitle: "About boo_box", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings(_:)), keyEquivalent: ",")
         appMenu.addItem(withTitle: "Reload Config & Themes", action: #selector(reloadConfig(_:)), keyEquivalent: "R")
@@ -473,6 +476,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func openSettings(_ sender: Any?) {
         showSettingsWindow()
+    }
+    @objc private func checkForUpdates(_ sender: Any?) {
+        SettingsNavState.shared.selectedTab = .general
+        showSettingsWindow()
+        UpdateManager.shared.checkForUpdates(userInitiated: true)
     }
 
     @objc private func configureActiveSandbox(_ sender: Any?) {

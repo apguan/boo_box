@@ -151,19 +151,27 @@ struct GeneralConfig: Codable, Equatable, Sendable {
     /// Show a dismissible confirmation alert before opening http(s) websites clicked inside sandboxed terminals.
     /// Non-http(s) URL schemes (e.g. file://, custom app links) always ask in sandboxed tabs.
     var confirmOpeningWebLinks: Bool = true
+    /// Automatically check `apguan/boo_box` on GitHub for new releases/updates on launch and periodically.
+    var autoUpdateEnabled: Bool = true
+    /// When automatic updates are enabled, automatically download and install verified GitHub Release updates.
+    var autoDownloadUpdates: Bool = false
 
     init(
         confirmBeforeDeletingSession: Bool = true,
         autoNameSessions: Bool = true,
         excludeEnvFilesWhenCloning: Bool = false,
         skipHeavyDirsWhenCloning: Bool = false,
-        confirmOpeningWebLinks: Bool = true
+        confirmOpeningWebLinks: Bool = true,
+        autoUpdateEnabled: Bool = true,
+        autoDownloadUpdates: Bool = false
     ) {
         self.confirmBeforeDeletingSession = confirmBeforeDeletingSession
         self.autoNameSessions = autoNameSessions
         self.excludeEnvFilesWhenCloning = excludeEnvFilesWhenCloning
         self.skipHeavyDirsWhenCloning = skipHeavyDirsWhenCloning
         self.confirmOpeningWebLinks = confirmOpeningWebLinks
+        self.autoUpdateEnabled = autoUpdateEnabled
+        self.autoDownloadUpdates = autoDownloadUpdates
     }
 
     init(from decoder: Decoder) throws {
@@ -173,6 +181,8 @@ struct GeneralConfig: Codable, Equatable, Sendable {
         self.excludeEnvFilesWhenCloning = try c.decodeIfPresent(Bool.self, forKey: .excludeEnvFilesWhenCloning) ?? false
         self.skipHeavyDirsWhenCloning = try c.decodeIfPresent(Bool.self, forKey: .skipHeavyDirsWhenCloning) ?? false
         self.confirmOpeningWebLinks = try c.decodeIfPresent(Bool.self, forKey: .confirmOpeningWebLinks) ?? true
+        self.autoUpdateEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoUpdateEnabled) ?? true
+        self.autoDownloadUpdates = try c.decodeIfPresent(Bool.self, forKey: .autoDownloadUpdates) ?? false
     }
 }
 
