@@ -1,19 +1,20 @@
-# boo_box
+# boo_box — Sandboxed macOS Terminal for AI Coding Agents
 
-A native macOS terminal built on **`libghostty` (`GhosttyKit`)** where every tab runs inside an isolated sandbox — built for safely running AI coding agents and untrusted dev workflows without exposing your Mac.
+**`boo_box`** is an open-source, native macOS **sandbox terminal** built on **Ghostty (`libghostty` / `GhosttyKit`)** that runs every tab behind kernel-enforced **AI agent guardrails**. Built for safely running autonomous coding agents — including **Claude Code**, **OpenAI Codex**, **OpenCode**, **Gemini CLI**, and **OMP** — as well as untrusted builds and scripts without exposing your Mac, personal files, real git checkouts, or API keys.
+
+Every workspace opens in **`~20 ms`** via an $O(1)$ Copy-on-Write overlay (`boobox-overlay`) inside a default-deny **macOS Seatbelt** (`sandbox-exec`) sandbox or an ephemeral **Apple Silicon Linux microVM** (`Virtualization.framework`), protected by a host-side **egress firewall & phantom-token secret vault** (`boobox-proxy`).
 
 <p align="center">
-  <img src="docs/screenshots/workspace-overlay.png" alt="boo_box macOS terminal running an isolated ~20 ms CoW overlay sandbox with Seatbelt isolation and opt-in pinned folders" width="960" />
+  <img src="docs/screenshots/workspace-overlay.png" alt="boo_box macOS sandbox terminal running an isolated ~20 ms CoW overlay sandbox with Seatbelt isolation and opt-in pinned folders" width="960" />
 </p>
 
 ---
 
-## Why `boo_box`?
+## Why Use a Sandboxed Terminal for AI Coding Agents?
 
-Running autonomous coding agents directly on your host shell gives them full access to `~/Desktop`, `~/Documents`, `~/.ssh`, your real git checkouts, and host API keys.
+Running autonomous coding agents directly in an unsandboxed terminal gives prompt-injected or misbehaving agents full read/write access to `~/Desktop`, `~/Documents`, `~/.ssh`, macOS Keychain, your real Git repositories, local databases, and raw LLM/cloud API keys.
 
-`boo_box` gives every session its own isolated sandbox while keeping native Ghostty GPU performance and zero-friction developer ergonomics:
-
+`boo_box` provides **local, zero-Docker agent guardrails** at native Ghostty Metal GPU speed:
 - **Three execution modes in one terminal:**
   1. **macOS Sandbox (default, `⌘T` / `boo .`):** Kernel-enforced macOS Seatbelt (`sandbox-exec`) with a per-session `$HOME` (`~/boo_box/sessions/<id>/`) and **~20 ms $O(1)$ Instant CoW Overlay** (`boobox-overlay`) — or optional APFS `clonefile(2)` snapshot (`boobox-clone`). Agents can edit or `rm -rf` freely without ever modifying your real repo or host files.
   2. **Private Linux MicroVM (`⇧⌘N`):** Ephemeral Apple Silicon `arm64` Linux microVM via Apple's `Virtualization.framework` (`vmlinux-arm64` + APFS-cloned Alpine `rootfs.ext4`, 1-slot warm VM pool, multi-PTY over `vsock` via `boobox-attach`). Zero Mac filesystem access by default; wiped on close.
@@ -29,6 +30,18 @@ Running autonomous coding agents directly on your host shell gives them full acc
   - Optional **APFS Full Clone** (`--clone` / `--full` / `--slim`, or in `Settings → General`) uses `boobox-clone` + kernel `clonefile(2)` + warm pool + Git delta sync for a frozen point-in-time snapshot.
   - Persistent detached PTYs (`booboxd`) keep running shells and coding agents alive across app quits and auto-updates, with 128 KiB scrollback replay on reattach.
   - Deleting saved/active sessions and running `rm -rf <dir>` inside sandboxes both use atomic move-aside + detached background reaping (`<5 ms`).
+
+## How `boo_box` Compares to Other Agent Sandboxes
+
+| Capability | Raw Terminal (iTerm2 / Ghostty) | Docker / Devcontainers | Cloud Agent Sandboxes | **`boo_box` (macOS Sandbox / MicroVM)** |
+|---|---|---|---|---|
+| **Workspace startup (350k-file monorepo)** | Instant *(no isolation)* | 5–60+ s image/bind mount | 10–60 s remote VM | **`~20 ms` $O(1)$ CoW Overlay** *(or ~250 ms warm Linux microVM)* |
+| **Protects host files (`~/Desktop`, `~/.ssh`, real repos)** | No | Partial *(bind mounts often RW)* | Yes *(remote)* | **Yes — kernel Seatbelt default-deny + `O_RDONLY` host lower layer** |
+| **Safe `rm -rf` / untrusted scripts** | Destructive on host | Inside container | Remote | **Isolated in `.overlay/upper/` or ephemeral microVM; host untouched** |
+| **API key & secret exfiltration guardrails** | Raw keys in env | Raw keys in env | Remote env | **Host-only Vault + `bbx_ph_…` phantom tokens + `403 leak_blocked`** |
+| **Outbound domain firewall & air-gapped offline mode** | No | Manual iptables | Varies | **Built-in (`Full` / `Dev Allowlist` / `Offline` + Seatbelt DNS lock)** |
+| **Native macOS toolchains & GPU Ghostty terminal** | Yes | Linux-only container | Web/SSH only | **Yes — native macOS Metal Ghostty + optional Linux microVM** |
+| **Works offline / zero cloud lock-in** | Yes | Yes | No | **100% local on Apple Silicon** |
 
 
 ## First-Time Setup (Recommended: Let Your Agent Do It)
@@ -186,3 +199,30 @@ boo setup-github --remove       # Delete GitHub token from Host Vault & disable 
 - **Host Secret Vault (`boobox-proxy`):** Real secret values live in the Seatbelt-denied Host Vault (`~/boo_box/vault/`, `0700`/`0600`, zero plaintext in `config.json`) or 1Password (`op://`) and are pushed to `boobox-proxy` over a `0600` Unix socket (`~/boo_box/run/proxy-ctl.sock`). Sandboxes only see `bbx_ph_...` phantom tokens; sending a phantom token to an unauthorized host or from an unauthorized session is blocked (`403`) and logged.
 - **Terminal Escape Hardening:** `clipboard-read = ask` is enforced via Ghostty's managed override; clicking `http(s)` links in sandboxed tabs displays a dismissible prompt (and non-web URL schemes always confirm before launching external macOS handlers).
 - **Private Linux MicroVM:** Hardware-virtualized via Apple `Virtualization.framework` with no host filesystem mounts by default and optional `Offline` mode (omits the virtual NIC completely).
+
+---
+
+## FAQ: AI Agent Sandboxing & Guardrails
+
+### How do I run Claude Code, Codex, OpenCode, Gemini CLI, or OMP in a sandbox on macOS without Docker?
+Install `boo_box`, run `boo .` inside any project directory (or click the sidebar **`📁`** button / press **`⇧⌘O`**), and launch your coding agent (`claude`, `codex`, `opencode`, `gemini`, `omp`) inside the tab. Each tab runs under a default-deny macOS Seatbelt profile (`sandbox-exec`) with an isolated `$HOME`, an isolated Copy-on-Write workspace, and read-only host toolchains — no Docker daemon or container image required.
+
+### Do edits, `git commit`, or `rm -rf` inside a `boo_box` sandbox modify my real files?
+No. In the default **Instant CoW Overlay** mode (`boobox-overlay`), your host directory is opened strictly read-only (`O_RDONLY | O_NOFOLLOW`). Every file write, rename, commit, or `rm -rf` is stored exclusively inside `~/boo_box/sessions/<id>/.overlay/upper/` and `.overlay/whiteouts.json`. In optional **APFS Clone** mode (`boo --clone .`), the folder is copied via APFS `clonefile(2)`. In **Private Linux MicroVM** mode (`⇧⌘N`), the VM has zero host mounts by default and is wiped on close.
+
+### How does `boo_box` stop prompt-injected agents from stealing API keys or exfiltrating secrets?
+API keys configured in **`Settings → Secrets & Network`** never enter the sandbox environment. Real values remain inside the Seatbelt-denied **Host Vault** (`~/boo_box/vault/`, `0700`/`0600`) or **1Password (`op://`)**. Sandboxes only receive worthless `bbx_ph_...` phantom tokens and Base-URL routes pointing to the local `boobox-proxy` sidecar, which swaps in the real header **only** for explicitly bound upstream hosts (e.g., `api.anthropic.com`, `api.openai.com`, `openrouter.ai`) and blocks + alerts (`403 leak_blocked`) on any exfiltration attempt to an unauthorized domain.
+
+### What outbound network guardrails are available?
+`boo_box` supports three kernel-enforced egress modes globally or per tab (**`⌥⌘,`**):
+- **`Full (Vault Protected)`:** Normal internet access with Host Vault phantom-token swapping and leak detection.
+- **`Dev Allowlist`:** Seatbelt denies direct outbound sockets and direct DNS (`/var/run/mDNSResponder`), routing all traffic through `boobox-proxy` and allowing only LLM APIs, package registries (`npm`, `PyPI`, `crates.io`, Go, GitHub), and your custom domains (with 1-click Allow toasts in the tab header for blocked hosts).
+- **`Offline (Air-gapped)`:** Blocks all outbound network traffic (and omits the virtual NIC completely in Private Linux MicroVMs).
+
+### How fast is `boo_box` on large monorepos?
+Mounting a 350,000-file monorepo or a 1.6M-file directory tree takes **`~18–25 ms`** ($O(1)$) with `boobox-overlay`, with zero extra SSD blocks for unchanged files. With pipelined NFSv3 TCP RPCs, `READDIR` caching, and automatic `core.checkStat=minimal` Git config injection, warm `git status` on a 350k-file monorepo completes in **`~0.56 s`** (compared to `~0.44 s` natively on APFS).
+
+### When should I use macOS Sandbox vs. Private Linux MicroVM vs. Raw Host Shell?
+- **macOS Sandbox (`⌘T` / `boo .`):** Daily coding agents, local macOS dev builds, and fast repo isolation (`~20 ms`).
+- **Private Linux MicroVM (`⇧⌘N`):** Completely untrusted code, Linux-native workloads, or zero-trust execution requiring a separate Linux kernel boundary (`Virtualization.framework`).
+- **Raw Host Shell (`⌥⌘T`):** Explicit unsandboxed escape hatch (with red warning header and border) for host maintenance like `brew upgrade` or system administration.
