@@ -752,6 +752,7 @@ struct ConnectionsSettingsTab: View {
                         self.configManager.config.sandboxAccess.allowHostGitConfig = true
                         self.configManager.config.sandboxAccess.shareGHConfig = true
                     }
+                    self.configManager.onSyncLiveEnv?()
                     self.state.statusIsError = false
                     self.state.statusBanner = msg
                     self.state.refreshStatus(config: self.configManager.config)
@@ -814,6 +815,7 @@ struct ConnectionsSettingsTab: View {
                 if service.id == "github" {
                     self.configManager.config.connections.accounts.removeAll { $0.id == "github" }
                 }
+                self.configManager.onSyncLiveEnv?()
                 self.state.statusIsError = false
                 self.state.statusBanner = "Disconnected \(service.name) and removed OAuth credentials."
                 self.state.refreshStatus(config: self.configManager.config)
@@ -882,8 +884,9 @@ struct ConnectionsSettingsTab: View {
                 }
                 DispatchQueue.main.async {
                     self.upsertConnectionMetadata(id: preset.id, envVar: preset.envVar, enabled: true, accountLabel: imported.label)
+                    self.configManager.onSyncLiveEnv?()
                     self.state.statusIsError = false
-                    self.state.statusBanner = "Imported \(preset.name) into macOS Keychain."
+                    self.state.statusBanner = "Imported \(preset.name) into host vault."
                     self.state.refreshStatus(config: self.configManager.config)
                 }
             } catch {
@@ -906,10 +909,11 @@ struct ConnectionsSettingsTab: View {
                 configManager.config.sandboxAccess.shareGHConfig = true
             }
             upsertConnectionMetadata(id: preset.id, envVar: preset.envVar, enabled: true)
+            configManager.onSyncLiveEnv?()
             state.draftToken = ""
             state.editingAdvancedID = nil
             state.statusIsError = false
-            state.statusBanner = "Saved \(preset.name) token in macOS Keychain."
+            state.statusBanner = "Saved \(preset.name) token in host vault."
             state.refreshStatus(config: configManager.config)
         } catch {
             state.statusIsError = true
@@ -920,9 +924,10 @@ struct ConnectionsSettingsTab: View {
     private func removeManualToken(_ preset: ConnectionPreset) {
         ConnectionsManager.shared.deleteToken(for: preset.id)
         configManager.config.connections.accounts.removeAll { $0.id == preset.id }
+        configManager.onSyncLiveEnv?()
         state.editingAdvancedID = nil
         state.statusIsError = false
-        state.statusBanner = "Removed \(preset.name) token from Keychain."
+        state.statusBanner = "Removed \(preset.name) token from host vault."
         state.refreshStatus(config: configManager.config)
     }
 

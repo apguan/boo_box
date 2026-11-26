@@ -1396,6 +1396,17 @@ final class SessionStore: ObservableObject {
         onThemeBackgroundChanged?(themeBackground)
     }
 
+    /// Immediately refreshes `.boobox-env.sh` and `boobox-git-cred` across every open macOS sandbox
+    /// so newly connected/disconnected Keychain tokens take effect on the very next command (`preexec`).
+    func syncLiveSandboxEnvironments() {
+        let activeSandboxes = sessions.compactMap { $0.mode == .sandbox ? $0.macSandbox : nil }
+        guard !activeSandboxes.isEmpty else { return }
+        let cfg = BooBoxConfigManager.shared.config
+        DispatchQueue.global(qos: .userInitiated).async {
+            MacOSSandboxManager.shared.syncLiveEnvFiles(for: activeSandboxes, config: cfg)
+        }
+    }
+
     // MARK: - Command Palette (`⌘P`)
 
     func toggleCommandPalette() {

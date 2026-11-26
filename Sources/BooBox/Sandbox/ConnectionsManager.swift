@@ -415,67 +415,70 @@ final class ConnectionsManager: @unchecked Sendable {
         mcpPresets.first { $0.id == id }
     }
 
-    // MARK: - macOS Keychain Token Storage (Zero Plaintext in config.json)
+    // MARK: - Host-Only Vault Token Storage (~/boo_box/vault/connections.json, 0700/0600, Seatbelt-denied)
+    // Stored outside config.json and outside legacy login Keychain so ad-hoc signed rebuilds/auto-updates
+    // and `boo setup-github` CLI never hang on macOS SecurityAgent Keychain ACL prompts.
+
+    private static let vaultLock = NSLock()
+
+    private var vaultDirURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
+            .appendingPathComponent("boo_box/vault", isDirectory: true)
+    }
+
+    private var vaultFileURL: URL {
+        vaultDirURL.appendingPathComponent("connections.json")
+    }
+
+    private func readVaultMapLocked() -> [String: String] {
+        guard let data = try? Data(contentsOf: vaultFileURL),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return map
+    }
+
+    private func writeVaultMapLocked(_ map: [String: String]) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: vaultDirURL, withIntermediateDirectories: true)
+        chmod(vaultDirURL.path, 0o700)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(map)
+        try data.write(to: vaultFileURL, options: .atomic)
+        chmod(vaultFileURL.path, 0o600)
+    }
 
     func saveToken(_ value: String, for connectionID: String) throws {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
+        guard !trimmed.isEmpty else {
             throw NSError(domain: "BooBox.Connections", code: -1, userInfo: [NSLocalizedDescriptionKey: "Token cannot be empty."])
         }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: connectionID,
-        ]
-        SecItemDelete(query as CFDictionary)
-        var add = query
-        add[kSecValueData as String] = data
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(add as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw NSError(
-                domain: "BooBox.Connections",
-                code: Int(status),
-                userInfo: [NSLocalizedDescriptionKey: "macOS Keychain save failed (OSStatus \(status))."]
-            )
-        }
+        Self.vaultLock.lock()
+        defer { Self.vaultLock.unlock() }
+        var map = readVaultMapLocked()
+        map[connectionID] = trimmed
+        try writeVaultMapLocked(map)
     }
 
     func readToken(for connectionID: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: connectionID,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var out: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &out)
-        guard status == errSecSuccess, let data = out as? Data else { return nil }
-        let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.vaultLock.lock()
+        defer { Self.vaultLock.unlock() }
+        let s = readVaultMapLocked()[connectionID]?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (s?.isEmpty == false) ? s : nil
     }
 
     func hasToken(for connectionID: String) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: connectionID,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+        readToken(for: connectionID) != nil
     }
 
     func deleteToken(for connectionID: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: connectionID,
-        ]
-        SecItemDelete(query as CFDictionary)
+        Self.vaultLock.lock()
+        defer { Self.vaultLock.unlock() }
+        var map = readVaultMapLocked()
+        guard map.removeValue(forKey: connectionID) != nil else { return }
+        try? writeVaultMapLocked(map)
     }
-
     /// Resolves enabled Keychain-backed connection tokens for injection into a sandbox's `0600` `.boobox-env.sh`.
     /// Respects per-sandbox `secretAccessMode == .none` (withholds all tokens in untrusted/zero-secret tabs).
     func resolvedSandboxEnvEntries(config cfg: BooBoxConfig, overrides: SandboxOverrideConfig) -> [(key: String, value: String)] {

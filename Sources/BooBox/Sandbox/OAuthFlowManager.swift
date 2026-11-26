@@ -169,54 +169,55 @@ final class OAuthFlowManager: @unchecked Sendable {
 
     // MARK: - Keychain Storage (dev.boo-box.oauth)
 
-    func saveTokenRecord(_ record: OAuthTokenRecord) throws {
-        let data = try JSONEncoder().encode(record)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: record.serviceID,
-        ]
-        let attrs: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrLabel as String: "boo_box OAuth: \(record.serviceID)",
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
-        ]
-        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
-        if status == errSecItemNotFound {
-            var add = query
-            for (k, v) in attrs { add[k] = v }
-            let addStatus = SecItemAdd(add as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw OAuthFlowError.tokenExchangeFailed("Keychain save failed (OSStatus \(addStatus))")
-            }
-        } else if status != errSecSuccess {
-            throw OAuthFlowError.tokenExchangeFailed("Keychain update failed (OSStatus \(status))")
+    private static let oauthVaultLock = NSLock()
+
+    private var oauthVaultDirURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
+            .appendingPathComponent("boo_box/vault", isDirectory: true)
+    }
+
+    private var oauthVaultFileURL: URL {
+        oauthVaultDirURL.appendingPathComponent("oauth.json")
+    }
+
+    private func readOAuthVaultLocked() -> [String: OAuthTokenRecord] {
+        guard let data = try? Data(contentsOf: oauthVaultFileURL),
+              let map = try? JSONDecoder().decode([String: OAuthTokenRecord].self, from: data) else {
+            return [:]
         }
+        return map
+    }
+
+    private func writeOAuthVaultLocked(_ map: [String: OAuthTokenRecord]) throws {
+        try FileManager.default.createDirectory(at: oauthVaultDirURL, withIntermediateDirectories: true)
+        chmod(oauthVaultDirURL.path, 0o700)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(map)
+        try data.write(to: oauthVaultFileURL, options: .atomic)
+        chmod(oauthVaultFileURL.path, 0o600)
+    }
+
+    func saveTokenRecord(_ record: OAuthTokenRecord) throws {
+        Self.oauthVaultLock.lock()
+        defer { Self.oauthVaultLock.unlock() }
+        var map = readOAuthVaultLocked()
+        map[record.serviceID] = record
+        try writeOAuthVaultLocked(map)
     }
 
     func loadTokenRecord(serviceID: String) -> OAuthTokenRecord? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: serviceID,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else {
-            return nil
-        }
-        return try? JSONDecoder().decode(OAuthTokenRecord.self, from: data)
+        Self.oauthVaultLock.lock()
+        defer { Self.oauthVaultLock.unlock() }
+        return readOAuthVaultLocked()[serviceID]
     }
 
     func deleteTokenRecord(serviceID: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: serviceID,
-        ]
-        SecItemDelete(query as CFDictionary)
+        Self.oauthVaultLock.lock()
+        defer { Self.oauthVaultLock.unlock() }
+        var map = readOAuthVaultLocked()
+        guard map.removeValue(forKey: serviceID) != nil else { return }
+        try? writeOAuthVaultLocked(map)
     }
 
     /// Returns true if the service has a live OAuth token in boo_box Keychain, OMP `agent.db`, or OpenCode `mcp-auth.json`.

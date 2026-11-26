@@ -1217,7 +1217,8 @@ final class BooBoxConfigManager: ObservableObject {
 
     /// Hook wired by AppDelegate / SessionStore so appearance & VM changes apply immediately.
     var onConfigChanged: ((_ old: BooBoxConfig, _ new: BooBoxConfig) -> Void)?
-
+    /// Hook wired by AppDelegate / SessionStore to immediately refresh live sandbox `.boobox-env.sh` files.
+    var onSyncLiveEnv: (() -> Void)?
     let rootDirURL: URL
     let configFileURL: URL
     let ghosttyOverrideURL: URL

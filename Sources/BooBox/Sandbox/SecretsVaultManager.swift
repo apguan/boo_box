@@ -62,69 +62,60 @@ final class SecretsVaultManager: @unchecked Sendable {
         resolveOnePasswordBinary() != nil
     }
 
-    // MARK: - Keychain Vault Operations (Host-Only)
+    // MARK: - Host-Only Vault Operations (~/boo_box/vault/secrets.json, 0700/0600, Seatbelt-denied)
+
+    private var hostVaultDirURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
+            .appendingPathComponent("boo_box/vault", isDirectory: true)
+    }
+
+    private var hostVaultFileURL: URL {
+        hostVaultDirURL.appendingPathComponent("secrets.json")
+    }
+
+    private func readSecretsVaultLocked() -> [String: String] {
+        guard let data = try? Data(contentsOf: hostVaultFileURL),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return map
+    }
+
+    private func writeSecretsVaultLocked(_ map: [String: String]) throws {
+        try FileManager.default.createDirectory(at: hostVaultDirURL, withIntermediateDirectories: true)
+        chmod(hostVaultDirURL.path, 0o700)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(map)
+        try data.write(to: hostVaultFileURL, options: .atomic)
+        chmod(hostVaultFileURL.path, 0o600)
+    }
 
     func saveKeychainSecret(_ value: String, for secretID: UUID) throws {
-        let account = secretID.uuidString
-        guard let data = value.data(using: .utf8) else {
-            throw MacSandboxError.cloneFailed("Invalid UTF-8 secret value")
-        }
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: account,
-        ]
-        let attributes: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
-        ]
-
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var addQuery = query
-            addQuery[kSecValueData as String] = data
-            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw MacSandboxError.cloneFailed("Keychain save failed (OSStatus \(addStatus))")
-            }
-        } else if status != errSecSuccess {
-            throw MacSandboxError.cloneFailed("Keychain update failed (OSStatus \(status))")
-        }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        var map = readSecretsVaultLocked()
+        map[secretID.uuidString] = value
+        try writeSecretsVaultLocked(map)
     }
 
     func readKeychainSecret(for secretID: UUID) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: secretID.uuidString,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let val = readSecretsVaultLocked()[secretID.uuidString]
+        return (val?.isEmpty == false) ? val : nil
     }
 
     func hasKeychainSecret(for secretID: UUID) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: secretID.uuidString,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+        readKeychainSecret(for: secretID) != nil
     }
 
     func deleteKeychainSecret(for secretID: UUID) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: secretID.uuidString,
-        ]
-        SecItemDelete(query as CFDictionary)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        var map = readSecretsVaultLocked()
+        guard map.removeValue(forKey: secretID.uuidString) != nil else { return }
+        try? writeSecretsVaultLocked(map)
     }
 
     private func resolveOnePasswordBinary() -> String? {

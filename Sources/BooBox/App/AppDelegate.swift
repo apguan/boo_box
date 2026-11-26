@@ -60,8 +60,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if old.secretsNetwork != new.secretsNetwork {
                 SecretsVaultManager.shared.syncPolicyToProxy()
             }
+            if old.connections != new.connections
+                || old.ephemeralSetup != new.ephemeralSetup
+                || old.sandboxAccess != new.sandboxAccess {
+                sessionStore?.syncLiveSandboxEnvironments()
+            }
         }
-
+        configManager.onSyncLiveEnv = { [weak sessionStore] in
+            sessionStore?.syncLiveSandboxEnvironments()
+        }
         setupMainMenu()
         createMainWindow(store: sessionStore)
         didFinishLaunching = true
@@ -96,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
             store.refreshSavedMacSessions()
+            store.syncLiveSandboxEnvironments()
         }
 
         NSApp.activate(ignoringOtherApps: true)
@@ -215,6 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case "reload_config":
             BooBoxConfigManager.shared.reloadFromDisk()
             store?.reloadGhosttyConfig()
+            store?.syncLiveSandboxEnvironments()
             return
         case "activate":
             break
