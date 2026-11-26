@@ -153,11 +153,10 @@ private struct GeneralSettingsTab: View {
 
                 SettingsCard(title: "Sessions") {
                     SettingsToggleRow(
-                        title: "Auto-name new sessions",
-                        subtitle: "Assigns memorable names (e.g. cobalt-fox) and updates automatically when you clone or enter a project folder, until you manually rename the session.",
+                        title: "Semantic auto-naming for sessions",
+                        subtitle: "Automatically names sessions from repo, Git branch, sub-package, or agent title (e.g. my-app · feat/auth) until you manually rename.",
                         isOn: $configManager.config.general.autoNameSessions
                     )
-
                     Divider()
 
                     SettingsToggleRow(

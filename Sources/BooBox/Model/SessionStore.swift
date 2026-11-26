@@ -67,6 +67,7 @@ final class TerminalPane: ObservableObject, Identifiable {
 
     var onBell: (() -> Void)?
     var onBecameFocused: (() -> Void)?
+    var onTitleChange: ((String) -> Void)?
     var onPwdChange: ((String) -> Void)?
 
     init(launchOptions: SurfaceLaunchOptions = SurfaceLaunchOptions()) {
@@ -76,6 +77,7 @@ final class TerminalPane: ObservableObject, Identifiable {
 
         self.surfaceView.onTitleChange = { [weak self] newTitle in
             self?.title = newTitle
+            self?.onTitleChange?(newTitle)
         }
         self.surfaceView.onPwdChange = { [weak self] newPwd in
             self?.pwd = newPwd
@@ -225,18 +227,32 @@ final class TerminalSession: ObservableObject, Identifiable {
         if let customTitle, !customTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return customTitle
         }
-        if !focusedTitle.isEmpty && focusedTitle != displayPwd && focusedTitle != "~" {
-            let isRedundantSandboxPath = macSandbox.map { sb in
-                focusedTitle.contains(sb.shortID) || focusedTitle.contains(sb.sessionDir.path)
-            } ?? false
-            if !isRedundantSandboxPath {
+        switch mode {
+        case .sandbox:
+            if let sb = macSandbox {
+                return sb.name
+            }
+            return sequenceNumber == 1 ? "scratch" : "scratch #\(sequenceNumber)"
+        case .linuxVM:
+            if !focusedTitle.isEmpty && focusedTitle != displayPwd && focusedTitle != "~" && focusedTitle != "zsh" && focusedTitle != "sh" {
                 return focusedTitle
             }
-        }
-        switch mode {
-        case .sandbox: return macSandbox?.name ?? "Session \(sequenceNumber)"
-        case .linuxVM: return "Private VM \(sequenceNumber)"
-        case .rawHost: return "Host \(sequenceNumber)"
+            if let pwd = focusedPwd, !pwd.isEmpty, pwd != "/root", pwd != "/" {
+                let folder = URL(fileURLWithPath: pwd).lastPathComponent
+                if !folder.isEmpty { return "linux-vm · \(folder)" }
+            }
+            return sequenceNumber == 1 ? "linux-vm" : "linux-vm #\(sequenceNumber)"
+        case .rawHost:
+            if !focusedTitle.isEmpty && focusedTitle != displayPwd && focusedTitle != "~" && focusedTitle != "zsh" && focusedTitle != "-zsh" && focusedTitle != "bash" {
+                return focusedTitle
+            }
+            if let pwd = focusedPwd, !pwd.isEmpty {
+                let home = NSHomeDirectory()
+                if pwd == home { return "~" }
+                let folder = URL(fileURLWithPath: pwd).lastPathComponent
+                if !folder.isEmpty { return folder }
+            }
+            return sequenceNumber == 1 ? "host" : "host #\(sequenceNumber)"
         }
     }
 
@@ -450,9 +466,8 @@ final class SessionStore: ObservableObject {
                 let excludeEnv = activeProjectExcludeEnvOverride ?? cfg.excludeEnvFilesWhenCloning
                 let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
                 let initialName: String = cfg.autoNameSessions
-                    ? "\(projectName) · \(MacOSSandboxManager.shared.generateAutoName(avoiding: existingNames))"
-                    : "\(projectName) \(seq)"
-
+                    ? MacOSSandboxManager.shared.semanticProjectName(projectName: projectName, sourceDir: templateURL, avoiding: existingNames)
+                    : MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
                 // Fast path (<5ms): pop pre-warmed APFS clone via atomic rename!
                 if let warmSandbox = MacOSSandboxManager.shared.popWarmProjectSession(
                     for: templateURL,
@@ -577,14 +592,18 @@ final class SessionStore: ObservableObject {
         let projectName = cleanName.isEmpty ? templateDirURL.lastPathComponent : cleanName
         let autoNameEnabled = BooBoxConfigManager.shared.config.general.autoNameSessions
         let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
+        let preclonedWS = MacOSSandboxManager.shared.sessionsRootURL
+            .appendingPathComponent("s-\(String(id.uuidString.prefix(8)).lowercased())/workspace", isDirectory: true)
         let initialName: String
         if autoNameEnabled {
-            let suffix = MacOSSandboxManager.shared.generateAutoName(avoiding: existingNames)
-            initialName = "\(projectName) · \(suffix)"
+            initialName = MacOSSandboxManager.shared.semanticProjectName(
+                projectName: projectName,
+                sourceDir: preclonedWS,
+                avoiding: existingNames
+            )
         } else {
-            initialName = "\(projectName) \(seq)"
+            initialName = MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
         }
-
         activeProjectTemplateURL = templateDirURL
         activeProjectDisplayName = projectName
         activeProjectExcludeEnvOverride = excludeEnvOverride
@@ -618,13 +637,10 @@ final class SessionStore: ObservableObject {
     private func createScratchMacSandboxSession(sequenceNumber seq: Int) -> TerminalSession? {
         let sessionID = UUID()
         let autoNameEnabled = BooBoxConfigManager.shared.config.general.autoNameSessions
-        let initialName: String
-        if autoNameEnabled {
-            let existing = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
-            initialName = MacOSSandboxManager.shared.generateAutoName(avoiding: existing)
-        } else {
-            initialName = "Session \(seq)"
-        }
+        let existing = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
+        let initialName: String = autoNameEnabled
+            ? MacOSSandboxManager.shared.semanticScratchName(avoiding: existing)
+            : "Session \(seq)"
         let sandbox: MacSandboxSession
         do {
             sandbox = try MacOSSandboxManager.shared.createSession(
@@ -647,12 +663,14 @@ final class SessionStore: ObservableObject {
         let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
         let initialName: String
         if autoNameEnabled {
-            let suffix = MacOSSandboxManager.shared.generateAutoName(avoiding: existingNames)
-            initialName = "\(projectName) · \(suffix)"
+            initialName = MacOSSandboxManager.shared.semanticProjectName(
+                projectName: projectName,
+                sourceDir: projectURL,
+                avoiding: existingNames
+            )
         } else {
-            initialName = "\(projectName) \(seq)"
+            initialName = MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
         }
-
         cloningProjectName = projectName
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<MacSandboxSession, Error> = Result {
@@ -1062,16 +1080,19 @@ final class SessionStore: ObservableObject {
               session.mode == .sandbox,
               session.customTitle == nil,
               var sb = session.macSandbox,
-              sb.sourceProjectPath == nil,
               !sb.hasUserCustomName else { return }
-        if let inferred = MacOSSandboxManager.shared.inferWorkspaceAutoName(for: sb, currentPwd: session.focusedPwd),
-           inferred != sb.name {
+        let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
+        if let inferred = MacOSSandboxManager.shared.inferSemanticSessionName(
+            for: sb,
+            currentPwd: session.focusedPwd,
+            oscTitle: session.focusedTitle,
+            avoiding: existingNames
+        ), inferred != sb.name {
             sb.name = inferred
             session.macSandbox = sb
             MacOSSandboxManager.shared.updateSessionName(sb, to: inferred, isUserCustom: false)
         }
     }
-
     func moveSession(from sourceIndex: Int, to destinationIndex: Int) {
         guard sessions.indices.contains(sourceIndex),
               destinationIndex >= 0,
@@ -1263,6 +1284,11 @@ final class SessionStore: ObservableObject {
                 session.refreshMirroredState()
                 self.stageView.updateFocusVisuals(for: session)
             }
+            self.updateAutoNameIfNeeded(for: session)
+        }
+        pane.onTitleChange = { [weak self, weak session] _ in
+            guard let self, let session else { return }
+            session.refreshMirroredState()
             self.updateAutoNameIfNeeded(for: session)
         }
         pane.onPwdChange = { [weak self, weak session] _ in

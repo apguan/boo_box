@@ -141,7 +141,7 @@ struct AppearanceConfig: Codable, Equatable, Sendable {
 struct GeneralConfig: Codable, Equatable, Sendable {
     /// Prompt with a warning alert before permanently deleting a session directory.
     var confirmBeforeDeletingSession: Bool = true
-    /// Automatically assign memorable names (and update from cloned repo/folder names until manually renamed).
+    /// Automatically name sessions from repo, Git branch, sub-package, or agent title until manually renamed.
     var autoNameSessions: Bool = true
     /// Exclude `.env` / `.env.*` files (except `.env.example`/`.sample`/`.template`) when cloning a project folder.
     var excludeEnvFilesWhenCloning: Bool = false

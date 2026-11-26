@@ -636,63 +636,290 @@ final class MacOSSandboxManager: @unchecked Sendable {
         }
     }
 
-    /// Generates a memorable, human-friendly two-word codename avoiding existing names.
-    func generateAutoName(avoiding existingNames: Set<String>) -> String {
-        let adjectives = [
-            "amber", "brisk", "cedar", "cobalt", "copper", "coral",
-            "crisp", "ember", "frost", "harbor", "indigo", "ivory",
-            "jade", "lunar", "maple", "misty", "mossy", "noble",
-            "ochre", "prism", "quartz", "silver", "solar", "velvet",
-        ]
-        let nouns = [
-            "badger", "canyon", "comet", "crane", "falcon", "finch",
-            "fox", "grove", "hawk", "heron", "kestrel", "lynx",
-            "otter", "owl", "peak", "pine", "plover", "raven",
-            "reef", "ridge", "river", "sparrow", "swift", "wolf",
-        ]
+    // MARK: - Semantic Session Naming (Tier 1 Initial + Tier 2 Live Context Upgrades)
+
+    private static let boringBranches: Set<String> = ["main", "master", "HEAD"]
+    private static let subpackageMarkers: [String] = [
+        "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "Package.swift",
+    ]
+    private static let genericShellTitles: Set<String> = [
+        "zsh", "-zsh", "sh", "-sh", "bash", "-bash", "fish", "-fish",
+        "login", "env", "sandbox-exec", "boo_box", "workspace", "~", "/",
+    ]
+
+    /// Appends `#2`, `#3`, … only when `base` collides with an existing session name.
+    func disambiguatedName(base: String, avoiding existingNames: Set<String>) -> String {
+        let cleanBase = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        let seed = cleanBase.isEmpty ? "scratch" : cleanBase
         let lowered = Set(existingNames.map { $0.lowercased() })
-        for _ in 0..<64 {
-            let candidate = "\(adjectives.randomElement()!)-\(nouns.randomElement()!)"
-            if !lowered.contains(candidate) {
+        if !lowered.contains(seed.lowercased()) {
+            return seed
+        }
+        for n in 2...999 {
+            let candidate = "\(seed) #\(n)"
+            if !lowered.contains(candidate.lowercased()) {
                 return candidate
             }
         }
-        return "\(adjectives.randomElement()!)-\(nouns.randomElement()!)-\(Int.random(in: 10...99))"
+        return "\(seed) #\(Int.random(in: 1000...9999))"
     }
 
-    /// Infers a clean workspace-derived name (e.g. a cloned repo folder inside `workspace/`).
-    func inferWorkspaceAutoName(for sandbox: MacSandboxSession, currentPwd: String?) -> String? {
+    /// Clean initial name for a scratch sandbox: `scratch`, `scratch #2`, …
+    func semanticScratchName(avoiding existingNames: Set<String>) -> String {
+        disambiguatedName(base: "scratch", avoiding: existingNames)
+    }
+
+    /// Clean initial name for a cloned project sandbox: `<repo>` (or `<repo> · <branch>` when on a feature branch),
+    /// disambiguated with `#2`, `#3`, … only if another open/saved session already shares that exact name.
+    func semanticProjectName(
+        projectName: String,
+        sourceDir: URL?,
+        avoiding existingNames: Set<String>
+    ) -> String {
+        let cleanRepo = Self.stripTemplateHashSuffix(projectName)
+        let branch = sourceDir.flatMap { readGitBranch(in: $0.path, boundaryDir: $0.path) }
+        let base: String
+        if let branch, !Self.boringBranches.contains(branch) {
+            base = "\(cleanRepo) · \(Self.compactBranch(branch))"
+        } else {
+            base = cleanRepo
+        }
+        return disambiguatedName(base: base, avoiding: existingNames)
+    }
+
+    /// Reads the active Git branch from `.git/HEAD` directly (~0.05 ms, zero subprocess forks).
+    /// Walks upward from `directory` up to `boundaryDir` to handle subdirectories and cloned repos.
+    func readGitBranch(in directory: String, boundaryDir: String) -> String? {
+        let fm = FileManager.default
+        let boundary = URL(fileURLWithPath: boundaryDir).standardizedFileURL.path
+        var cur = URL(fileURLWithPath: directory).standardizedFileURL
+
+        for _ in 0..<10 {
+            let curPath = cur.path
+            let gitPath = cur.appendingPathComponent(".git").path
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: gitPath, isDirectory: &isDir) {
+                let headPath: String
+                if isDir.boolValue {
+                    headPath = gitPath + "/HEAD"
+                } else if let pointer = try? String(contentsOfFile: gitPath, encoding: .utf8),
+                          pointer.hasPrefix("gitdir:") {
+                    let rel = pointer.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let resolved = rel.hasPrefix("/") ? rel : cur.appendingPathComponent(rel).standardizedFileURL.path
+                    headPath = resolved + "/HEAD"
+                } else {
+                    return nil
+                }
+                if let raw = try? String(contentsOfFile: headPath, encoding: .utf8) {
+                    let head = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if head.hasPrefix("ref: refs/heads/") {
+                        let branch = String(head.dropFirst("ref: refs/heads/".count))
+                        return branch.isEmpty ? nil : branch
+                    }
+                }
+                return nil
+            }
+            if curPath == boundary || curPath == "/" || !curPath.hasPrefix(boundary) {
+                break
+            }
+            cur.deleteLastPathComponent()
+        }
+        return nil
+    }
+
+    /// Live Tier 2 semantic session name inferred from current workspace state:
+    /// 1) Non-shell agent/tool OSC title (e.g. Claude / omp / Codex task title),
+    /// 2) Cloned project + active Git feature branch + monorepo sub-package (`repo/api · feat/auth`),
+    /// 3) Scratch workspace cloned repo folder + branch (`my-repo · fix-bug`).
+    func inferSemanticSessionName(
+        for sandbox: MacSandboxSession,
+        currentPwd: String?,
+        oscTitle: String?,
+        avoiding existingNames: Set<String>
+    ) -> String? {
         let wsPath = sandbox.workspaceDir.path
-        // 1. If the user navigated into a named subfolder under workspace/, prefer its top-level folder name.
+        let activeDir: String
+        if let pwd = currentPwd, pwd == wsPath || pwd.hasPrefix(wsPath + "/") {
+            activeDir = pwd
+        } else {
+            activeDir = wsPath
+        }
+
+        // 1. Meaningful agent/tool OSC title (filtered to reject shells, raw paths, and sandbox IDs)
+        if let cleanedTitle = Self.cleanSemanticOSCTitle(oscTitle, for: sandbox) {
+            if let repoBase = baseProjectName(for: sandbox) {
+                if cleanedTitle.lowercased().hasPrefix(repoBase.lowercased()) {
+                    return cleanedTitle
+                }
+                // Keep short titles paired with repo context; long task titles stand alone cleanly
+                if cleanedTitle.count <= 16 {
+                    return "\(repoBase) · \(cleanedTitle)"
+                }
+                return cleanedTitle
+            }
+            return cleanedTitle
+        }
+
+        // 2. Cloned project sandbox -> `<repo>[/<subpkg>][ · <branch>]`
+        if let repoBase = baseProjectName(for: sandbox) {
+            let subpkg = detectSubpackageName(currentDir: activeDir, workspaceRoot: wsPath)
+            let branch = readGitBranch(in: activeDir, boundaryDir: wsPath)
+            let targetBase: String
+            if let subpkg {
+                targetBase = "\(repoBase)/\(subpkg)"
+            } else {
+                targetBase = repoBase
+            }
+            let desired: String
+            if let branch, !Self.boringBranches.contains(branch) {
+                desired = "\(targetBase) · \(Self.compactBranch(branch))"
+            } else {
+                desired = targetBase
+            }
+            // Preserve existing `#N` disambiguator if base hasn't changed (prevents oscillation)
+            if sandbox.name.lowercased() == desired.lowercased()
+                || sandbox.name.lowercased().hasPrefix(desired.lowercased() + " #") {
+                return nil
+            }
+            var others = existingNames
+            others.remove(sandbox.name)
+            return disambiguatedName(base: desired, avoiding: others)
+        }
+
+        // 3. Scratch sandbox -> detect cloned/entered top-level project folder + its branch
+        var folderName: String? = nil
+        var folderPath: String? = nil
         if let pwd = currentPwd, pwd.hasPrefix(wsPath + "/") {
             let rel = String(pwd.dropFirst(wsPath.count + 1))
             if let first = rel.split(separator: "/").first {
                 let name = String(first)
                 if !name.isEmpty && !name.hasPrefix(".") {
-                    return name
+                    folderName = name
+                    folderPath = wsPath + "/" + name
                 }
             }
         }
-        // 2. Otherwise, if workspace/ contains exactly one non-hidden subdirectory (e.g. `git clone`), use it.
-        let fm = FileManager.default
-        if let entries = try? fm.contentsOfDirectory(
-            at: sandbox.workspaceDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            let dirs = entries.filter {
-                (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            }
-            if dirs.count == 1 {
-                let name = dirs[0].lastPathComponent
-                if !name.isEmpty && !name.hasPrefix(".") {
-                    return name
+        if folderName == nil {
+            let fm = FileManager.default
+            if let entries = try? fm.contentsOfDirectory(
+                at: sandbox.workspaceDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                let dirs = entries.filter {
+                    (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                }
+                if dirs.count == 1 {
+                    let name = dirs[0].lastPathComponent
+                    if !name.isEmpty && !name.hasPrefix(".") {
+                        folderName = name
+                        folderPath = dirs[0].path
+                    }
                 }
             }
+        }
+        guard let folderName, let folderPath else { return nil }
+        let branch = readGitBranch(in: activeDir, boundaryDir: folderPath)
+        let desired: String
+        if let branch, !Self.boringBranches.contains(branch) {
+            desired = "\(folderName) · \(Self.compactBranch(branch))"
+        } else {
+            desired = folderName
+        }
+        if sandbox.name.lowercased() == desired.lowercased()
+            || sandbox.name.lowercased().hasPrefix(desired.lowercased() + " #") {
+            return nil
+        }
+        var others = existingNames
+        others.remove(sandbox.name)
+        return disambiguatedName(base: desired, avoiding: others)
+    }
+
+    /// Extracts a clean repo name from `sandbox.sourceProjectPath` (stripping template `-<10hex>` suffix if present).
+    private func baseProjectName(for sandbox: MacSandboxSession) -> String? {
+        guard let src = sandbox.sourceProjectPath, !src.isEmpty else { return nil }
+        let raw = URL(fileURLWithPath: src).lastPathComponent
+        let cleaned = Self.stripTemplateHashSuffix(raw)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    /// Strips `boo_box`'s internal template hash suffix (`<project>-<10-hex-chars>`) when `sourceProjectPath`
+    /// points into `~/boo_box/templates/`.
+    static func stripTemplateHashSuffix(_ raw: String) -> String {
+        let parts = raw.split(separator: "-", omittingEmptySubsequences: false)
+        if parts.count >= 2, let last = parts.last, last.count == 10,
+           last.allSatisfy({ ("0"..."9").contains($0) || ("a"..."f").contains($0) || ("A"..."F").contains($0) }) {
+            let prefix = parts.dropLast().joined(separator: "-")
+            if !prefix.isEmpty { return prefix }
+        }
+        return raw
+    }
+
+    private static func compactBranch(_ branch: String) -> String {
+        if branch.count <= 24 { return branch }
+        if let slash = branch.lastIndex(of: "/") {
+            let tail = String(branch[branch.index(after: slash)...])
+            if !tail.isEmpty && tail.count <= 24 { return tail }
+        }
+        return String(branch.prefix(23)) + "…"
+    }
+
+    /// Detects the nearest nested sub-package directory strictly inside `workspaceRoot`
+    /// (e.g. `workspace/apps/api/src` -> `"api"` when `apps/api/package.json` exists).
+    private func detectSubpackageName(currentDir: String, workspaceRoot: String) -> String? {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: workspaceRoot).standardizedFileURL.path
+        var cur = URL(fileURLWithPath: currentDir).standardizedFileURL
+        guard cur.path != root && cur.path.hasPrefix(root + "/") else { return nil }
+
+        for _ in 0..<8 {
+            let path = cur.path
+            if path == root || !path.hasPrefix(root + "/") { break }
+            for marker in Self.subpackageMarkers {
+                if fm.fileExists(atPath: path + "/" + marker) {
+                    let name = cur.lastPathComponent
+                    if !name.isEmpty && !name.hasPrefix(".") && name != "src" && name != "dist" && name != "build" {
+                        return name
+                    }
+                }
+            }
+            cur.deleteLastPathComponent()
         }
         return nil
     }
 
+    /// Filters terminal OSC titles to keep genuine agent/task titles while rejecting bare shells,
+    /// raw file paths, host prompts, and internal sandbox IDs.
+    static func cleanSemanticOSCTitle(_ raw: String?, for sandbox: MacSandboxSession) -> String? {
+        guard var title = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else {
+            return nil
+        }
+        // Strip leading spinner / status glyphs commonly emitted by CLI coding agents
+        let leadingTrim = CharacterSet(charactersIn: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✳⠐⠒⠂•●◦⏳✓✔✗✖⚡🤖 ")
+        while let first = title.unicodeScalars.first, leadingTrim.contains(first) {
+            title.unicodeScalars.removeFirst()
+        }
+        title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard title.count >= 2 else { return nil }
+
+        let lower = title.lowercased()
+        if genericShellTitles.contains(lower) { return nil }
+        if title.hasPrefix("/") || title.hasPrefix("~/") || title.hasPrefix("workspace/") { return nil }
+        if title.contains(sandbox.shortID) || title.contains(sandbox.sessionDir.path) { return nil }
+        // Reject `user@host: path` or `host: ~/dir` shell default titles
+        if title.contains("@") && title.contains(":") { return nil }
+        // Reject bare paths ending in directory segments with slashes (unless short repo/subpkg)
+        if title.filter({ $0 == "/" }).count >= 2 && !title.contains(" ") { return nil }
+        // Reject noisy command lines that are just `cd ...` or `ls`
+        let firstWord = lower.split(separator: " ").first.map(String.init) ?? lower
+        if ["cd", "ls", "ll", "pwd", "clear", "exit", "cat", "echo", "zsh", "bash", "sh"].contains(firstWord) {
+            return nil
+        }
+        if title.count > 38 {
+            return String(title.prefix(37)) + "…"
+        }
+        return title
+    }
     func workspaceFileCount(for sandbox: MacSandboxSession) -> Int {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(atPath: sandbox.workspaceDir.path) else {
