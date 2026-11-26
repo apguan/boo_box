@@ -14,8 +14,9 @@ final class OverlayClient: @unchecked Sendable {
     let controlSocketPath: String
 
     private init() {
-        let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
-        self.controlSocketPath = home.appendingPathComponent("boo_box/run/overlay.sock").path
+        let runDir = BooBoxPaths.rootDirURL.appendingPathComponent("run", isDirectory: true)
+        try? FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
+        self.controlSocketPath = runDir.appendingPathComponent("overlay.sock").path
     }
 
     var currentPort: UInt16 {
@@ -52,7 +53,8 @@ final class OverlayClient: @unchecked Sendable {
 
         let proc = Process()
         proc.executableURL = binURL
-        proc.arguments = []
+        let customDir = ProcessInfo.processInfo.environment["BOOBOX_DATA_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        proc.arguments = (customDir?.isEmpty == false) ? ["--control-socket", controlSocketPath] : []
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice

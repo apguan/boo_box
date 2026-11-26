@@ -194,15 +194,15 @@ if [ "$USE_OVERLAY" -eq 1 ]; then
     ESC_DIR="${ABS_DIR//\\/\\\\}"; ESC_DIR="${ESC_DIR//\"/\\\"}"
     ESC_NAME="${PROJ_NAME//\\/\\\\}"; ESC_NAME="${ESC_NAME//\"/\\\"}"
     NO_ENV_JSON="false"; [ "$NO_ENV" -eq 1 ] && NO_ENV_JSON="true"
-    PAYLOAD="{\"op\":\"open\",\"path\":\"$ESC_DIR\",\"name\":\"$ESC_NAME\",\"noEnv\":$NO_ENV_JSON}"
+    FORCE_OVERLAY_JSON="false"; [ "$CLONE_MODE" = "overlay" ] && FORCE_OVERLAY_JSON="true"
+    PAYLOAD="{\"op\":\"open\",\"path\":\"$ESC_DIR\",\"name\":\"$ESC_NAME\",\"noEnv\":$NO_ENV_JSON,\"overlay\":$FORCE_OVERLAY_JSON}"
     if [ -S "$SOCK_PATH" ] && "$CLONE_BIN" --ipc-send "$SOCK_PATH" "$PAYLOAD" 2>/dev/null; then
         exit 0
     fi
-    if [ "$NO_ENV" -eq 1 ]; then
-        open -a "$APP_PATH" --args --dir "$ABS_DIR" --name "$PROJ_NAME" --no-env
-    else
-        open -a "$APP_PATH" --args --dir "$ABS_DIR" --name "$PROJ_NAME"
-    fi
+    OPEN_ARGS=(--dir "$ABS_DIR" --name "$PROJ_NAME")
+    [ "$NO_ENV" -eq 1 ] && OPEN_ARGS+=(--no-env)
+    [ "$CLONE_MODE" = "overlay" ] && OPEN_ARGS+=(--overlay)
+    open -a "$APP_PATH" --args "${OPEN_ARGS[@]}"
     exit 0
 fi
 

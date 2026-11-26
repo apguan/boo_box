@@ -22,8 +22,9 @@ final class DaemonClient: @unchecked Sendable {
     private let startLock = NSLock()
 
     private init() {
-        let realHome = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
-        self.controlSocketPath = "\(realHome)/boo_box/run/booboxd.sock"
+        let runDir = BooBoxPaths.rootDirURL.appendingPathComponent("run", isDirectory: true)
+        try? FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
+        self.controlSocketPath = runDir.appendingPathComponent("booboxd.sock").path
     }
 
     func resolveDaemonBinaryURL() -> URL? {

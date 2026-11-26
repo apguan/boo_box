@@ -422,8 +422,7 @@ final class ConnectionsManager: @unchecked Sendable {
     private static let vaultLock = NSLock()
 
     private var vaultDirURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
-            .appendingPathComponent("boo_box/vault", isDirectory: true)
+        BooBoxPaths.rootDirURL.appendingPathComponent("vault", isDirectory: true)
     }
 
     private var vaultFileURL: URL {

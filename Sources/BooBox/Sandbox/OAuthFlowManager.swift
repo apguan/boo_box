@@ -172,8 +172,7 @@ final class OAuthFlowManager: @unchecked Sendable {
     private static let oauthVaultLock = NSLock()
 
     private var oauthVaultDirURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
-            .appendingPathComponent("boo_box/vault", isDirectory: true)
+        BooBoxPaths.rootDirURL.appendingPathComponent("vault", isDirectory: true)
     }
 
     private var oauthVaultFileURL: URL {
@@ -384,7 +383,7 @@ final class OAuthFlowManager: @unchecked Sendable {
         try checkCancelled()
 
         // 6. Exchange authorization code for access + refresh tokens
-        onProgress(OAuthProgressEvent(message: "Saving \(preset.name) credentials to Keychain…", deviceCode: nil))
+        onProgress(OAuthProgressEvent(message: "Saving \(preset.name) credentials to Host Vault…", deviceCode: nil))
         let tokenResp = try exchangeCodeForToken(
             tokenEndpoint: meta.tokenEndpoint,
             code: code,
@@ -439,7 +438,7 @@ final class OAuthFlowManager: @unchecked Sendable {
             .map(\.displayName)
             .joined(separator: ", ")
         if agentNames.isEmpty {
-            return "Connected \(preset.name) via browser OAuth (saved in Keychain)."
+            return "Connected \(preset.name) via browser OAuth (saved in Host Vault)."
         }
         return "Connected \(preset.name) via browser OAuth — synced to \(agentNames)."
     }
@@ -864,7 +863,7 @@ final class OAuthFlowManager: @unchecked Sendable {
                 status: "200 OK",
                 html: callbackHTML(
                     title: "Connected \(serviceName) to boo_box",
-                    detail: "OAuth credentials saved to macOS Keychain and synced to your coding agents. You can close this tab.",
+                    detail: "OAuth credentials saved to boo_box Host Vault and synced to your coding agents. You can close this tab.",
                     ok: true
                 )
             )

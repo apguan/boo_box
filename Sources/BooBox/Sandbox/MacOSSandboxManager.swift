@@ -25,6 +25,7 @@ struct MacSandboxMetadata: Codable, Sendable {
     var sourceProjectPath: String?
     var overrides: SandboxOverrideConfig
     var isOverlay: Bool
+    var excludeEnvFiles: Bool?
 
     init(
         id: UUID,
@@ -34,7 +35,8 @@ struct MacSandboxMetadata: Codable, Sendable {
         hasUserCustomName: Bool = false,
         sourceProjectPath: String? = nil,
         overrides: SandboxOverrideConfig = .default,
-        isOverlay: Bool = false
+        isOverlay: Bool = false,
+        excludeEnvFiles: Bool? = nil
     ) {
         self.id = id
         self.shortID = shortID
@@ -44,6 +46,7 @@ struct MacSandboxMetadata: Codable, Sendable {
         self.sourceProjectPath = sourceProjectPath
         self.overrides = overrides
         self.isOverlay = isOverlay
+        self.excludeEnvFiles = excludeEnvFiles
     }
 
     init(from decoder: Decoder) throws {
@@ -56,6 +59,7 @@ struct MacSandboxMetadata: Codable, Sendable {
         self.sourceProjectPath = try c.decodeIfPresent(String.self, forKey: .sourceProjectPath)
         self.overrides = try c.decodeIfPresent(SandboxOverrideConfig.self, forKey: .overrides) ?? .default
         self.isOverlay = try c.decodeIfPresent(Bool.self, forKey: .isOverlay) ?? false
+        self.excludeEnvFiles = try c.decodeIfPresent(Bool.self, forKey: .excludeEnvFiles)
     }
 }
 
@@ -68,6 +72,7 @@ struct MacSandboxSession: Identifiable, Sendable {
     let sourceProjectPath: String?
     var overrides: SandboxOverrideConfig
     let isOverlay: Bool
+    let excludeEnvFiles: Bool?
     let sessionDir: URL
     let workspaceDir: URL
     let homeDir: URL
@@ -118,7 +123,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
     private init() {
         let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
         self.realHomeURL = home
-        self.sessionsRootURL = home.appendingPathComponent("boo_box/sessions", isDirectory: true)
+        self.sessionsRootURL = BooBoxPaths.rootDirURL.appendingPathComponent("sessions", isDirectory: true)
         try? FileManager.default.createDirectory(at: sessionsRootURL, withIntermediateDirectories: true)
         cleanupStaleTemplateArtifacts()
         cleanupStaleSessionTrash()
@@ -196,15 +201,16 @@ final class MacOSSandboxManager: @unchecked Sendable {
         hasUserCustomName: Bool = false,
         sourceProjectURL: URL? = nil,
         excludeEnvFilesOverride: Bool? = nil,
-        forceAPFSClone: Bool = false
+        forceAPFSClone: Bool = false,
+        workspaceModeOverride: WorkspaceIsolationMode? = nil
     ) throws -> MacSandboxSession {
         let shortID = "s-\(id.uuidString.prefix(8).lowercased())"
         let sessionDir = sessionsRootURL.appendingPathComponent(shortID, isDirectory: true).resolvingSymlinksInPath()
         let validatedSource = try sourceProjectURL.map { try validateProjectDirectory($0) }
         let cfg = BooBoxConfigManager.currentSnapshot().general
         let excludeEnv = excludeEnvFilesOverride ?? cfg.excludeEnvFilesWhenCloning
-        let useOverlay = (validatedSource != nil) && !forceAPFSClone && (cfg.workspaceMode == .overlay)
-
+        let effectiveMode = forceAPFSClone ? .apfsClone : (workspaceModeOverride ?? cfg.workspaceMode)
+        let useOverlay = (validatedSource != nil) && (effectiveMode == .overlay)
         if let src = validatedSource, useOverlay {
             let overlayDir = sessionDir.appendingPathComponent(".overlay", isDirectory: true)
             let upperDir = overlayDir.appendingPathComponent("upper", isDirectory: true)
@@ -233,7 +239,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
                 hasUserCustomName: hasUserCustomName,
                 sourceProjectPath: src.path,
                 sessionDir: sessionDir,
-                isOverlay: true
+                isOverlay: true,
+                excludeEnvFiles: excludeEnv
             )
         }
 
@@ -245,7 +252,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: hasUserCustomName,
             sourceProjectPath: validatedSource?.path,
             sessionDir: sessionDir,
-            isOverlay: false
+            isOverlay: false,
+            excludeEnvFiles: excludeEnv
         )
         if let src = validatedSource {
             activeCloneLock.lock()
@@ -595,19 +603,26 @@ final class MacOSSandboxManager: @unchecked Sendable {
         }
     }
 
-    func prepareForResume(_ sandbox: MacSandboxSession) throws -> MacSandboxSession {
-        if sandbox.isOverlay, let srcPath = sandbox.sourceProjectPath,
-           !OverlayClient.isPathNFSMounted(sandbox.workspaceDir.path) {
-            let cfg = BooBoxConfigManager.currentSnapshot().general
-            try OverlayClient.shared.mount(
-                sessionID: sandbox.shortID,
-                lowerDir: srcPath,
-                upperDir: sandbox.overlayUpperDir.path,
-                whiteoutFile: sandbox.overlayWhiteoutURL.path,
-                mountPoint: sandbox.workspaceDir.path,
-                excludeEnv: cfg.excludeEnvFilesWhenCloning
-            )
+    func ensureOverlayMountedIfNeeded(_ sandbox: MacSandboxSession) throws {
+        guard sandbox.isOverlay,
+              let srcPath = sandbox.sourceProjectPath,
+              !OverlayClient.isPathNFSMounted(sandbox.workspaceDir.path) else {
+            return
         }
+        let cfg = BooBoxConfigManager.currentSnapshot().general
+        let excludeEnv = sandbox.excludeEnvFiles ?? cfg.excludeEnvFilesWhenCloning
+        try OverlayClient.shared.mount(
+            sessionID: sandbox.shortID,
+            lowerDir: srcPath,
+            upperDir: sandbox.overlayUpperDir.path,
+            whiteoutFile: sandbox.overlayWhiteoutURL.path,
+            mountPoint: sandbox.workspaceDir.path,
+            excludeEnv: excludeEnv
+        )
+    }
+
+    func prepareForResume(_ sandbox: MacSandboxSession) throws -> MacSandboxSession {
+        try ensureOverlayMountedIfNeeded(sandbox)
         return try materializeSession(
             id: sandbox.id,
             shortID: sandbox.shortID,
@@ -617,7 +632,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             sourceProjectPath: sandbox.sourceProjectPath,
             sessionDir: sandbox.sessionDir,
             overrides: sandbox.overrides,
-            isOverlay: sandbox.isOverlay
+            isOverlay: sandbox.isOverlay,
+            excludeEnvFiles: sandbox.excludeEnvFiles
         )
     }
 
@@ -631,7 +647,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             sourceProjectPath: sandbox.sourceProjectPath,
             sessionDir: sandbox.sessionDir,
             overrides: overrides,
-            isOverlay: sandbox.isOverlay
+            isOverlay: sandbox.isOverlay,
+            excludeEnvFiles: sandbox.excludeEnvFiles
         )
         SecretsVaultManager.shared.updateSessionPolicy(for: sandbox.shortID, overrides: overrides)
         return updated
@@ -646,11 +663,11 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: isUserCustom,
             sourceProjectPath: sandbox.sourceProjectPath,
             overrides: sandbox.overrides,
-            isOverlay: sandbox.isOverlay
+            isOverlay: sandbox.isOverlay,
+            excludeEnvFiles: sandbox.excludeEnvFiles
         )
         writeMetadata(meta, to: sandbox.metadataURL)
     }
-
     // MARK: - APFS Zero-Copy Project Cloning (`clonefile(2)`)
 
     private static let heavyDirs: Set<String> = [
@@ -1069,13 +1086,27 @@ final class MacOSSandboxManager: @unchecked Sendable {
         }
         return title
     }
+    /// Counts top-level edits in `.overlay/upper/` + recorded whiteouts/opaque dirs for an overlay session.
+    func overlayEditCount(for sandbox: MacSandboxSession) -> Int {
+        let fm = FileManager.default
+        var edits = 0
+        if let upperItems = try? fm.contentsOfDirectory(atPath: sandbox.overlayUpperDir.path) {
+            edits += upperItems.filter { $0 != ".DS_Store" }.count
+        }
+        if let data = try? Data(contentsOf: sandbox.overlayWhiteoutURL),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let wh = (obj["whiteouts"] as? [String])?.count ?? 0
+            let op = (obj["opaqueDirs"] as? [String])?.count ?? 0
+            edits += wh + op
+        }
+        return edits
+    }
+
     func workspaceFileCount(for sandbox: MacSandboxSession) -> Int {
         let fm = FileManager.default
         if sandbox.isOverlay {
-            if let upperItems = try? fm.contentsOfDirectory(atPath: sandbox.overlayUpperDir.path),
-               !upperItems.filter({ $0 != ".DS_Store" }).isEmpty {
-                return upperItems.count
-            }
+            let edits = overlayEditCount(for: sandbox)
+            if edits > 0 { return edits }
             if let src = sandbox.sourceProjectPath, fm.fileExists(atPath: src) {
                 return 1
             }
@@ -1129,6 +1160,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             sourceProjectPath: meta.sourceProjectPath,
             overrides: meta.overrides,
             isOverlay: meta.isOverlay,
+            excludeEnvFiles: meta.excludeEnvFiles,
             sessionDir: dir,
             workspaceDir: wsURL,
             homeDir: dir.appendingPathComponent(".home", isDirectory: true),
@@ -1172,6 +1204,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
                 sourceProjectPath: meta.sourceProjectPath,
                 overrides: meta.overrides,
                 isOverlay: meta.isOverlay,
+                excludeEnvFiles: meta.excludeEnvFiles,
                 sessionDir: resolvedDir,
                 workspaceDir: wsURL,
                 homeDir: resolvedDir.appendingPathComponent(".home", isDirectory: true),
@@ -1184,7 +1217,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
                 // Clean up empty abandoned session dirs asynchronously (never stall sidebar refresh)
                 deleteSessionDir(sandbox)
             } else {
-                items.append(SavedMacSandboxItem(sandbox: sandbox, fileCount: count))
+                let displayCount = sandbox.isOverlay ? overlayEditCount(for: sandbox) : count
+                items.append(SavedMacSandboxItem(sandbox: sandbox, fileCount: displayCount))
             }
         }
 
@@ -1373,7 +1407,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
         sourceProjectPath: String?,
         sessionDir: URL,
         overrides: SandboxOverrideConfig = .default,
-        isOverlay: Bool = false
+        isOverlay: Bool = false,
+        excludeEnvFiles: Bool? = nil
     ) throws -> MacSandboxSession {
         let fm = FileManager.default
         let cfg = BooBoxConfigManager.currentSnapshot().applying(overrides: overrides)
@@ -1417,6 +1452,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             sourceProjectPath: sourceProjectPath,
             overrides: overrides,
             isOverlay: isOverlay,
+            excludeEnvFiles: excludeEnvFiles,
             sessionDir: sessionDir,
             workspaceDir: workspaceDir,
             homeDir: homeDir,
@@ -1473,7 +1509,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             hasUserCustomName: hasUserCustomName,
             sourceProjectPath: sourceProjectPath,
             overrides: overrides,
-            isOverlay: isOverlay
+            isOverlay: isOverlay,
+            excludeEnvFiles: excludeEnvFiles
         )
         writeMetadata(meta, to: metadataURL)
         return sandbox
@@ -1662,6 +1699,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             }
             addAncestorMetadata(for: toolsPath)
         }
+        addAncestorMetadata(for: sandbox.sessionDir.path)
 
         let extraMetadataBlock = extraMetadataPaths
             .map { "    (literal \"\(sbplEscape($0))\")" }
@@ -1696,13 +1734,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
                     : ""
                 let localDevAllow = access.blockLocalNetwork
                     ? "(allow network-outbound (remote tcp \"localhost:\(port)\"))"
-                    : """
-                    (allow network-outbound
-                        (remote ip "localhost:*")
-                        (remote ip "127.0.0.1:*")
-                        (remote ip "::1:*")
-                    )
-                    """
+                    : "(allow network-outbound (remote ip \"localhost:*\"))"
                 return """
                 ;; 4. Proxy-locked egress (\(netCfg.egressMode.rawValue)): deny direct external IP traffic
                 (deny network-outbound (remote ip))
@@ -1716,11 +1748,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
                 } ?? ""
                 return """
                 ;; 4. Opt-in local network block (prevents reaching host localhost DBs/services, while allowing boobox-proxy)
-                (deny network-outbound
-                    (remote ip "localhost:*")
-                    (remote ip "127.0.0.1:*")
-                    (remote ip "::1:*")
-                )
+                (deny network-outbound (remote ip "localhost:*"))
                 \(proxyAllow)
                 """
             }
@@ -1761,6 +1789,8 @@ final class MacOSSandboxManager: @unchecked Sendable {
             (literal "\(realHome)")
             (literal "\(realHome)/boo_box")
             (literal "\(realHome)/boo_box/sessions")
+            (literal "\(sbplEscape(BooBoxPaths.rootDirURL.path))")
+            (literal "\(sbplEscape(sessionsRootURL.path))")
             (literal "\(sessionPath)")
             (literal "\(realHome)/Library")
             (literal "\(realHome)/Library/Application Support")
@@ -1822,6 +1852,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             (literal "\(sessionPath)/.clone-meta.json")
             (subpath "\(sessionPath)/.overlay")
             (subpath "\(realHome)/boo_box/vault")
+            (subpath "\(sbplEscape(BooBoxPaths.rootDirURL.appendingPathComponent("vault").path))")
         )
         (deny file-write*
             (literal "\(profilePath)")
@@ -1831,6 +1862,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
             (subpath "\(sessionPath)/.home/.boobox-bin")
             (subpath "\(sessionPath)/.overlay")
             (subpath "\(realHome)/boo_box/vault")
+            (subpath "\(sbplEscape(BooBoxPaths.rootDirURL.appendingPathComponent("vault").path))")
         )
         \(networkPolicyBlock)
         \(overlayPortBlock)

@@ -2436,8 +2436,9 @@ guard bindRC == 0, Darwin.listen(ctlFD, 32) == 0 else {
     exit(1)
 }
 chmod(controlSockPath, 0o600)
-try? "\(getpid())\n".write(toFile: pidFilePath, atomically: true, encoding: .utf8)
-
+if customControlSock == nil {
+    try? "\(getpid())\n".write(toFile: pidFilePath, atomically: true, encoding: .utf8)
+}
 // Print ready line for callers inspecting stdout
 fputs("BOOBOX_OVERLAY_READY port=\(daemon.port) pid=\(getpid())\n", stdout)
 fflush(stdout)

@@ -149,7 +149,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let idx = args.firstIndex(of: "--dir"), idx + 1 < args.count {
             handledStartupTarget = true
             let url = URL(fileURLWithPath: args[idx + 1], isDirectory: true)
-            store?.openProjectFolder(url, displayName: customName, excludeEnvOverride: noEnv ? true : nil)
+            let forceOverlay = args.contains("--overlay")
+            store?.openProjectFolder(
+                url,
+                displayName: customName,
+                excludeEnvOverride: noEnv ? true : nil,
+                forceOverlay: forceOverlay
+            )
         }
     }
 
@@ -179,11 +185,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                           let rawPath = comps.queryItems?.first(where: { $0.name == "path" })?.value,
                           !rawPath.isEmpty {
                     let noEnv = comps.queryItems?.first(where: { $0.name == "noenv" })?.value == "1"
+                    let forceOverlay = comps.queryItems?.first(where: { $0.name == "overlay" })?.value == "1"
                     let customName = comps.queryItems?.first(where: { $0.name == "name" })?.value
                     store?.openProjectFolder(
                         URL(fileURLWithPath: rawPath, isDirectory: true),
                         displayName: customName,
-                        excludeEnvOverride: noEnv ? true : nil
+                        excludeEnvOverride: noEnv ? true : nil,
+                        forceOverlay: forceOverlay
                     )
                 }
             } else if url.isFileURL {
@@ -217,7 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 store?.openProjectFolder(
                     URL(fileURLWithPath: path, isDirectory: true),
                     displayName: msg.name,
-                    excludeEnvOverride: (msg.noEnv == true) ? true : nil
+                    excludeEnvOverride: (msg.noEnv == true) ? true : nil,
+                    forceOverlay: msg.overlay == true
                 )
             }
         case "reload_config":
@@ -582,6 +591,7 @@ private struct AppIPCMessage: Decodable, Sendable {
     let template: String?
     let path: String?
     let noEnv: Bool?
+    let overlay: Bool?
 }
 
 private final class AppIPCServer: @unchecked Sendable {
@@ -592,8 +602,7 @@ private final class AppIPCServer: @unchecked Sendable {
     private var stopped = false
 
     init(onMessage: @escaping @Sendable (AppIPCMessage) -> Void) {
-        let realHome = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
-        let runDir = "\(realHome)/boo_box/run"
+        let runDir = BooBoxPaths.rootDirURL.appendingPathComponent("run", isDirectory: true).path
         try? FileManager.default.createDirectory(atPath: runDir, withIntermediateDirectories: true)
         chmod(runDir, 0o700)
         self.socketPath = "\(runDir)/app.sock"

@@ -2,6 +2,24 @@ import AppKit
 import Foundation
 import SwiftUI
 
+enum BooBoxPaths {
+    /// Root boo_box state directory (`~/boo_box` by default; overridable via `BOOBOX_DATA_DIR` for isolated profiles/tests).
+    nonisolated static var rootDirURL: URL {
+        if let raw = ProcessInfo.processInfo.environment["BOOBOX_DATA_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            let expanded = (raw as NSString).expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: expanded, withIntermediateDirectories: true)
+            if let resolved = realpath(expanded, nil) {
+                defer { free(resolved) }
+                return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+            }
+            return URL(fileURLWithPath: expanded, isDirectory: true).resolvingSymlinksInPath()
+        }
+        let realHome = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).resolvingSymlinksInPath()
+        return realHome.appendingPathComponent("boo_box", isDirectory: true)
+    }
+}
+
 // MARK: - Config Schema (~/boo_box/config.json)
 
 enum PackageCacheAccessMode: String, Codable, CaseIterable, Sendable, Identifiable {
@@ -355,7 +373,7 @@ enum VaultSecretSource: String, Codable, CaseIterable, Sendable, Identifiable {
 
     var label: String {
         switch self {
-        case .keychain: "macOS Keychain"
+        case .keychain: "Host Vault"
         case .onePassword: "1Password (op://)"
         }
     }
@@ -1248,8 +1266,7 @@ final class BooBoxConfigManager: ObservableObject {
     private var suppressAutosave = false
 
     private init() {
-        let realHome = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).resolvingSymlinksInPath()
-        let root = realHome.appendingPathComponent("boo_box", isDirectory: true)
+        let root = BooBoxPaths.rootDirURL
         self.rootDirURL = root
         self.configFileURL = root.appendingPathComponent("config.json")
         self.ghosttyOverrideURL = root.appendingPathComponent(".ghostty-override.conf")

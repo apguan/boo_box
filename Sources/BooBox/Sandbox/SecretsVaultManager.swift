@@ -40,8 +40,7 @@ final class SecretsVaultManager: @unchecked Sendable {
     private let controlSocketPath: String
 
     private init() {
-        let realHome = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
-        let runDir = "\(realHome)/boo_box/run"
+        let runDir = BooBoxPaths.rootDirURL.appendingPathComponent("run", isDirectory: true).path
         try? FileManager.default.createDirectory(atPath: runDir, withIntermediateDirectories: true)
         chmod(runDir, 0o700)
         self.controlSocketPath = "\(runDir)/proxy-ctl.sock"
@@ -65,8 +64,7 @@ final class SecretsVaultManager: @unchecked Sendable {
     // MARK: - Host-Only Vault Operations (~/boo_box/vault/secrets.json, 0700/0600, Seatbelt-denied)
 
     private var hostVaultDirURL: URL {
-        URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
-            .appendingPathComponent("boo_box/vault", isDirectory: true)
+        BooBoxPaths.rootDirURL.appendingPathComponent("vault", isDirectory: true)
     }
 
     private var hostVaultFileURL: URL {
