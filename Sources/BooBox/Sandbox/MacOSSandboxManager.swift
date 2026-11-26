@@ -1294,9 +1294,7 @@ final class MacOSSandboxManager: @unchecked Sendable {
         let cpShimURL = booboxBinDir.appendingPathComponent("cp")
         try Self.cpShimScript.write(to: cpShimURL, atomically: true, encoding: .utf8)
         chmod(cpShimURL.path, 0o555)
-        let gitCredShimURL = booboxBinDir.appendingPathComponent("boobox-git-cred")
-        try Self.gitCredShimScript.write(to: gitCredShimURL, atomically: true, encoding: .utf8)
-        chmod(gitCredShimURL.path, 0o555)
+        installCredentialAndCLIShims(in: booboxBinDir)
         let zshrcURL = homeDir.appendingPathComponent(".zshrc")
         try generateSandboxZshrc(for: sandbox, config: cfg).write(to: zshrcURL, atomically: true, encoding: .utf8)
         let meta = MacSandboxMetadata(
@@ -1893,25 +1891,68 @@ final class MacOSSandboxManager: @unchecked Sendable {
     private static let gitCredShimScript = """
     #!/bin/sh
     [ "$1" = "get" ] || exit 0
+    [ -f "$HOME/.boobox-env.sh" ] && . "$HOME/.boobox-env.sh"
     [ -n "$GH_TOKEN" ] || exit 0
     printf 'username=x-access-token\\npassword=%s\\n' "$GH_TOKEN"
     """
 
-    /// Writes (or refreshes) a sandbox's private `0600 ~/.boobox-env.sh` and `0555 ~/.boobox-bin/boobox-git-cred`.
+    /// Hot-reloads `$HOME/.boobox-env.sh` right before invoking real `git` so even pre-existing
+    /// shells and already-running coding agents (`claude`/`omp`/`codex`) pick up new GitHub OAuth
+    /// credentials immediately with zero restart.
+    private static let gitShimScript = """
+    #!/bin/sh
+    [ -f "$HOME/.boobox-env.sh" ] && . "$HOME/.boobox-env.sh"
+    for _cand in /Library/Developer/CommandLineTools/usr/bin/git /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git; do
+        if [ -x "$_cand" ]; then
+            exec "$_cand" "$@"
+        fi
+    done
+    exec /usr/bin/git "$@"
+    """
+
+    /// Hot-reloads `$HOME/.boobox-env.sh` right before invoking real `gh` so `gh pr`/`gh auth`
+    /// immediately pick up newly connected GitHub credentials inside already-open tabs and agents.
+    private static let ghShimScript = """
+    #!/bin/sh
+    [ -f "$HOME/.boobox-env.sh" ] && . "$HOME/.boobox-env.sh"
+    if [ -n "$GH_TOKEN" ] && [ -z "$GH_CONFIG_DIR" ]; then
+        export GH_CONFIG_DIR="${TMPDIR:-/tmp}/boobox-gh-cfg"
+    fi
+    for _cand in /opt/homebrew/bin/gh /usr/local/bin/gh /usr/bin/gh; do
+        if [ -x "$_cand" ]; then
+            exec "$_cand" "$@"
+        fi
+    done
+    echo "boo_box: gh CLI not found on host" >&2
+    exit 127
+    """
+
+    private func installCredentialAndCLIShims(in booboxBinDir: URL) {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: booboxBinDir, withIntermediateDirectories: true)
+        let shims: [(String, String)] = [
+            ("boobox-git-cred", Self.gitCredShimScript),
+            ("git", Self.gitShimScript),
+            ("gh", Self.ghShimScript),
+        ]
+        for (name, body) in shims {
+            let url = booboxBinDir.appendingPathComponent(name)
+            try? body.write(to: url, atomically: true, encoding: .utf8)
+            chmod(url.path, 0o555)
+        }
+    }
+
+    /// Writes (or refreshes) a sandbox's private `0600 ~/.boobox-env.sh` and `0555` credential/CLI shims.
     /// Called both on session creation/resume and immediately whenever Connections/Env settings change so
-    /// already-open shells hot-reload new or revoked tokens before their very next command (`preexec`).
+    /// already-open shells and running agents hot-reload new or revoked tokens on the very next command.
     func writeSandboxEnvFile(for sandbox: MacSandboxSession, config cfg: BooBoxConfig) {
         let fm = FileManager.default
         let homeDir = sandbox.homeDir
         guard fm.fileExists(atPath: homeDir.path) else { return }
 
         let booboxBinDir = homeDir.appendingPathComponent(".boobox-bin", isDirectory: true)
-        try? fm.createDirectory(at: booboxBinDir, withIntermediateDirectories: true)
+        installCredentialAndCLIShims(in: booboxBinDir)
         let gitCredShimURL = booboxBinDir.appendingPathComponent("boobox-git-cred")
-        if !fm.fileExists(atPath: gitCredShimURL.path) {
-            try? Self.gitCredShimScript.write(to: gitCredShimURL, atomically: true, encoding: .utf8)
-            chmod(gitCredShimURL.path, 0o555)
-        }
 
         let envFileURL = homeDir.appendingPathComponent(".boobox-env.sh")
         var mergedEnv: [(key: String, value: String)] = ConnectionsManager.shared.resolvedSandboxEnvEntries(

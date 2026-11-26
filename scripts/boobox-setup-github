@@ -215,9 +215,17 @@ fi
 if [ -n "$FINAL_EMAIL" ] && [ "$FINAL_EMAIL" != "$CUR_EMAIL" ]; then
   git config --global user.email "$FINAL_EMAIL"
 fi
-if command -v gh >/dev/null 2>&1; then
-  GH_TOKEN="$TOKEN" gh auth setup-git >/dev/null 2>&1 || true
+GH_BIN="$(command -v gh 2>/dev/null || true)"
+if [ -n "$GH_BIN" ]; then
+  HELPER_CMD="!/bin/sh -c 'if [ -x \"\$HOME/.boobox-bin/boobox-git-cred\" ]; then exec \"\$HOME/.boobox-bin/boobox-git-cred\" \"\$@\"; else exec $GH_BIN auth git-credential \"\$@\"; fi' --"
+else
+  HELPER_CMD="!/bin/sh -c 'if [ -x \"\$HOME/.boobox-bin/boobox-git-cred\" ]; then exec \"\$HOME/.boobox-bin/boobox-git-cred\" \"\$@\"; fi' --"
 fi
+for GH_HOST in "https://github.com" "https://gist.github.com"; do
+  git config --global --unset-all "credential.${GH_HOST}.helper" 2>/dev/null || true
+  git config --global --add "credential.${GH_HOST}.helper" ""
+  git config --global --add "credential.${GH_HOST}.helper" "$HELPER_CMD"
+done
 
 # Store token inside Seatbelt-denied host vault (0700/0600) — NEVER in config.json!
 mkdir -p "$VAULT_DIR"

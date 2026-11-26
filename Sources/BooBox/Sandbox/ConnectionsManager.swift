@@ -557,8 +557,17 @@ final class ConnectionsManager: @unchecked Sendable {
             }
         }
 
-        if let ghBin {
-            _ = runCapture(ghBin, ["auth", "setup-git"], extraEnv: ["GH_TOKEN": token])
+        // Wire host ~/.gitconfig with a sandbox-aware GitHub credential helper:
+        // - Inside any boo_box sandbox (even already-open shells without GH_TOKEN in env), delegates to
+        //   `$HOME/.boobox-bin/boobox-git-cred` which live-sources `$HOME/.boobox-env.sh`.
+        // - On the real host Mac, falls back to `gh auth git-credential` identically to `gh auth setup-git`.
+        let helperFallback = ghBin.map { "exec \($0) auth git-credential \"$@\"" } ?? "exit 0"
+        let helperCmd = "!/bin/sh -c 'if [ -x \"$HOME/.boobox-bin/boobox-git-cred\" ]; then exec \"$HOME/.boobox-bin/boobox-git-cred\" \"$@\"; else \(helperFallback); fi' --"
+        for host in ["https://github.com", "https://gist.github.com"] {
+            let key = "credential.\(host).helper"
+            _ = runCapture("/usr/bin/git", ["config", "--global", "--unset-all", key])
+            _ = runCapture("/usr/bin/git", ["config", "--global", "--add", key, ""])
+            _ = runCapture("/usr/bin/git", ["config", "--global", "--add", key, helperCmd])
         }
         return loginLabel
     }
