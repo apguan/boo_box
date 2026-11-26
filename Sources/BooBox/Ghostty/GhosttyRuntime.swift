@@ -9,6 +9,7 @@ enum GhosttyHostAction: Sendable {
     case newSplit(direction: SplitDirection)
     case gotoSplit(direction: SplitFocusDirection)
     case gotoTab(target: Int)
+    case toggleCommandPalette
     case reloadConfig
     case quit
 }
@@ -240,6 +241,20 @@ final class GhosttyRuntime {
             targetSurfaceView?.handleBell()
             return true
 
+        case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
+            let dn = action.action.desktop_notification
+            let title = dn.title.map { String(cString: $0) } ?? ""
+            let body = dn.body.map { String(cString: $0) } ?? ""
+            targetSurfaceView?.handleDesktopNotification(title: title, body: body)
+            return true
+
+        case GHOSTTY_ACTION_COMMAND_FINISHED:
+            let cf = action.action.command_finished
+            targetSurfaceView?.handleCommandFinished(exitCode: Int(cf.exit_code), durationNs: cf.duration)
+            return true
+
+        case GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE:
+            return onHostAction?(.toggleCommandPalette, targetSurfaceView) ?? false
         case GHOSTTY_ACTION_MOUSE_SHAPE:
             targetSurfaceView?.handleMouseShape(action.action.mouse_shape)
             return true
@@ -321,7 +336,6 @@ final class GhosttyRuntime {
              GHOSTTY_ACTION_CONFIG_CHANGE,
              GHOSTTY_ACTION_SELECTION_CHANGED,
              GHOSTTY_ACTION_RENDERER_HEALTH,
-             GHOSTTY_ACTION_COMMAND_FINISHED,
              GHOSTTY_ACTION_MOUSE_OVER_LINK,
              GHOSTTY_ACTION_QUIT_TIMER,
              GHOSTTY_ACTION_SHOW_GTK_INSPECTOR,

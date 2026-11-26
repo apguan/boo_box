@@ -31,9 +31,10 @@ final class TerminalSurfaceView: NSView {
     var onPwdChange: ((String) -> Void)?
     var onProgressChange: ((TerminalProgress?) -> Void)?
     var onBell: (() -> Void)?
+    var onDesktopNotification: ((String, String) -> Void)?
+    var onCommandFinished: ((Int, UInt64) -> Void)?
     var onFocusChange: ((Bool) -> Void)?
     var onChildExited: ((UInt32) -> Void)?
-
     private(set) var isFocused: Bool = false
     private(set) var cellSize: CGSize = CGSize(width: 8, height: 16)
     private var markedText = NSMutableAttributedString()
@@ -746,6 +747,13 @@ final class TerminalSurfaceView: NSView {
         onBell?()
     }
 
+    func handleDesktopNotification(title: String, body: String) {
+        onDesktopNotification?(title, body)
+    }
+
+    func handleCommandFinished(exitCode: Int, durationNs: UInt64) {
+        onCommandFinished?(exitCode, durationNs)
+    }
     func handleMouseShape(_ shape: ghostty_action_mouse_shape_e) {
         currentCursor = GhosttyInput.cursor(for: shape)
         window?.invalidateCursorRects(for: self)

@@ -155,6 +155,12 @@ struct GeneralConfig: Codable, Equatable, Sendable {
     var autoUpdateEnabled: Bool = true
     /// When automatic updates are enabled, automatically download and install verified GitHub Release updates.
     var autoDownloadUpdates: Bool = false
+    /// Send native macOS notifications when unfocused tabs finish long commands, ring bells, or emit agent notifications.
+    var desktopNotificationsEnabled: Bool = true
+    /// Remember open sessions across app restarts and auto-updates.
+    var restoreSessionsOnLaunch: Bool = true
+    /// Run macOS Sandbox PTYs through `booboxd` so live shells and coding agents survive quits and auto-updates.
+    var persistentSessionsEnabled: Bool = true
 
     init(
         confirmBeforeDeletingSession: Bool = true,
@@ -163,7 +169,10 @@ struct GeneralConfig: Codable, Equatable, Sendable {
         skipHeavyDirsWhenCloning: Bool = false,
         confirmOpeningWebLinks: Bool = true,
         autoUpdateEnabled: Bool = true,
-        autoDownloadUpdates: Bool = false
+        autoDownloadUpdates: Bool = false,
+        desktopNotificationsEnabled: Bool = true,
+        restoreSessionsOnLaunch: Bool = true,
+        persistentSessionsEnabled: Bool = true
     ) {
         self.confirmBeforeDeletingSession = confirmBeforeDeletingSession
         self.autoNameSessions = autoNameSessions
@@ -172,6 +181,9 @@ struct GeneralConfig: Codable, Equatable, Sendable {
         self.confirmOpeningWebLinks = confirmOpeningWebLinks
         self.autoUpdateEnabled = autoUpdateEnabled
         self.autoDownloadUpdates = autoDownloadUpdates
+        self.desktopNotificationsEnabled = desktopNotificationsEnabled
+        self.restoreSessionsOnLaunch = restoreSessionsOnLaunch
+        self.persistentSessionsEnabled = persistentSessionsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -183,6 +195,9 @@ struct GeneralConfig: Codable, Equatable, Sendable {
         self.confirmOpeningWebLinks = try c.decodeIfPresent(Bool.self, forKey: .confirmOpeningWebLinks) ?? true
         self.autoUpdateEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoUpdateEnabled) ?? true
         self.autoDownloadUpdates = try c.decodeIfPresent(Bool.self, forKey: .autoDownloadUpdates) ?? false
+        self.desktopNotificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .desktopNotificationsEnabled) ?? true
+        self.restoreSessionsOnLaunch = try c.decodeIfPresent(Bool.self, forKey: .restoreSessionsOnLaunch) ?? true
+        self.persistentSessionsEnabled = try c.decodeIfPresent(Bool.self, forKey: .persistentSessionsEnabled) ?? true
     }
 }
 
