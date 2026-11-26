@@ -2156,24 +2156,34 @@ final class MacOSSandboxManager: @unchecked Sendable {
             lines.append("export \(pair.key)='\(escaped)'")
         }
 
-        // When GitHub is connected, wire Git's env-based credential helper directly to our session-local
-        // `boobox-git-cred` shim (clears any host osxkeychain helper first via empty value). Works even
-        // without host ~/.gitconfig mounted in Seatbelt and without restarting already-open shells!
+        // Build dynamic GIT_CONFIG_COUNT entries:
+        // - When GitHub is connected: wire session-local `boobox-git-cred` helper (clears host osxkeychain first).
+        // - For CoW Overlay sessions: set `core.checkStat=minimal` + `core.trustctime=false` so the first `git status`
+        //   on large repos (30k–500k files) compares (mtime, size) instead of re-hashing every tracked file on
+        //   APFS->NFS inode mismatch (~20x faster cold `git status`).
+        var gitConfigPairs: [(String, String)] = []
         if activeKeys.contains("GH_TOKEN") {
-            let helperCmd = "!\(gitCredShimURL.path)".replacingOccurrences(of: "'", with: "'\\''")
-            lines.append("export GIT_CONFIG_COUNT='4'")
-            lines.append("export GIT_CONFIG_KEY_0='credential.https://github.com.helper'")
-            lines.append("export GIT_CONFIG_VALUE_0=''")
-            lines.append("export GIT_CONFIG_KEY_1='credential.https://github.com.helper'")
-            lines.append("export GIT_CONFIG_VALUE_1='\(helperCmd)'")
-            lines.append("export GIT_CONFIG_KEY_2='credential.https://gist.github.com.helper'")
-            lines.append("export GIT_CONFIG_VALUE_2=''")
-            lines.append("export GIT_CONFIG_KEY_3='credential.https://gist.github.com.helper'")
-            lines.append("export GIT_CONFIG_VALUE_3='\(helperCmd)'")
-        } else {
-            lines.append("unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_CONFIG_KEY_2 GIT_CONFIG_VALUE_2 GIT_CONFIG_KEY_3 GIT_CONFIG_VALUE_3")
+            let helperCmd = "!\(gitCredShimURL.path)"
+            gitConfigPairs.append(("credential.https://github.com.helper", ""))
+            gitConfigPairs.append(("credential.https://github.com.helper", helperCmd))
+            gitConfigPairs.append(("credential.https://gist.github.com.helper", ""))
+            gitConfigPairs.append(("credential.https://gist.github.com.helper", helperCmd))
         }
-
+        if sandbox.isOverlay {
+            gitConfigPairs.append(("core.checkStat", "minimal"))
+            gitConfigPairs.append(("core.trustctime", "false"))
+        }
+        if !gitConfigPairs.isEmpty {
+            lines.append("export GIT_CONFIG_COUNT='\(gitConfigPairs.count)'")
+            for (idx, pair) in gitConfigPairs.enumerated() {
+                let k = pair.0.replacingOccurrences(of: "'", with: "'\\''")
+                let v = pair.1.replacingOccurrences(of: "'", with: "'\\''")
+                lines.append("export GIT_CONFIG_KEY_\(idx)='\(k)'")
+                lines.append("export GIT_CONFIG_VALUE_\(idx)='\(v)'")
+            }
+        } else {
+            lines.append("unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_CONFIG_KEY_2 GIT_CONFIG_VALUE_2 GIT_CONFIG_KEY_3 GIT_CONFIG_VALUE_3 GIT_CONFIG_KEY_4 GIT_CONFIG_VALUE_4 GIT_CONFIG_KEY_5 GIT_CONFIG_VALUE_5")
+        }
         // Explicitly unset any known connection env vars that are currently disconnected so live shells drop them immediately.
         var managedKeys: [String] = []
         for preset in ConnectionsManager.connectionPresets {

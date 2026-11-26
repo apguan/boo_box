@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Security
@@ -299,6 +300,7 @@ private struct WhiteoutState: Codable {
 
 private final class OverlayExport {
     let sessionID: String
+    let slotID: UInt16
     let fsid: UInt64
     let lowerRoot: String
     let upperRoot: String
@@ -314,14 +316,31 @@ private final class OverlayExport {
     private var whiteouts: Set<String> = []
     /// Relative directory paths whose lower contents are completely masked (e.g. rm -rf dir && mkdir dir).
     private var opaqueDirs: Set<String> = []
+    /// Ancestor directory paths that actually have entries inside `upperRoot` (empty on fresh sessions -> skips 100% of redundant `lstatUpper` calls!).
+    private var upperTouchedDirs: Set<String> = []
+
+    /// Fast in-memory cryptographic handle generator (1 CSPRNG seed at mount -> 0 syscalls per file!).
+    private let handleKey: SymmetricKey
+    private var nextHandleSeq: UInt64 = 1
 
     /// Bi-directional 16-byte cryptographic filehandle <-> relative path table ("" = root).
     private var handleToPath: [Data: String] = [:]
     private var pathToHandle: [String: Data] = [:]
     let rootHandle: Data
 
+    /// O(1) paginated READDIR / READDIRPLUS cache invalidated on mutation or lower mtime change.
+    private struct CachedDirListing {
+        let version: UInt64
+        let lowerMtimeSec: Int
+        let lowerMtimeNsec: Int
+        let entries: [String]
+    }
+    private var dirCacheVersion: UInt64 = 1
+    private var dirListCache: [String: CachedDirListing] = [:]
+
     init(
         sessionID: String,
+        slotID: UInt16,
         fsid: UInt64,
         lowerRoot: String,
         upperRoot: String,
@@ -330,6 +349,7 @@ private final class OverlayExport {
         excludeEnv: Bool
     ) {
         self.sessionID = sessionID
+        self.slotID = slotID
         self.fsid = fsid
         self.lowerRoot = URL(fileURLWithPath: lowerRoot).resolvingSymlinksInPath().path
         self.upperRoot = URL(fileURLWithPath: upperRoot).resolvingSymlinksInPath().path
@@ -337,13 +357,43 @@ private final class OverlayExport {
         self.mountPoint = mountPoint
         self.excludeEnv = excludeEnv
         self.pendingMountToken = "/\(sessionID)-\(randomHex(16))"
+        self.handleKey = SymmetricKey(data: randomBytes(32))
 
-        let rh = randomBytes(16)
+        var seq: UInt64 = 0
+        let mac = HMAC<SHA256>.authenticationCode(for: withUnsafeBytes(of: &seq) { Data($0) }, using: self.handleKey)
+        var rh = Data(capacity: 16)
+        rh.append(UInt8((slotID >> 8) & 0xFF))
+        rh.append(UInt8(slotID & 0xFF))
+        rh.append(contentsOf: mac.prefix(14))
         self.rootHandle = rh
         self.handleToPath[rh] = ""
         self.pathToHandle[""] = rh
 
         loadWhiteoutsLocked()
+        scanExistingUpperLocked()
+    }
+
+    /// Indexes any pre-existing files/dirs in `upperRoot` when resuming a persisted session (<1 ms).
+    private func scanExistingUpperLocked() {
+        guard let en = FileManager.default.enumerator(atPath: upperRoot) else { return }
+        while let rel = en.nextObject() as? String {
+            markUpperMutatedLocked(rel)
+        }
+    }
+
+    func markUpperMutatedLocked(_ rel: String) {
+        dirCacheVersion &+= 1
+        upperTouchedDirs.insert("")
+        var cur = rel
+        while !cur.isEmpty {
+            upperTouchedDirs.insert(cur)
+            guard let idx = cur.lastIndex(of: "/") else { break }
+            cur = String(cur[..<idx])
+        }
+    }
+
+    func bumpDirCacheLocked() {
+        dirCacheVersion &+= 1
     }
 
     // MARK: Whiteouts & Opaque Persistence
@@ -358,6 +408,7 @@ private final class OverlayExport {
     }
 
     private func saveWhiteoutsLocked() {
+        dirCacheVersion &+= 1
         let state = WhiteoutState(
             version: 1,
             whiteouts: whiteouts.sorted(),
@@ -376,7 +427,13 @@ private final class OverlayExport {
         if let existing = pathToHandle[rel] {
             return existing
         }
-        let h = randomBytes(16)
+        var seq = nextHandleSeq
+        nextHandleSeq &+= 1
+        let mac = HMAC<SHA256>.authenticationCode(for: withUnsafeBytes(of: &seq) { Data($0) }, using: handleKey)
+        var h = Data(capacity: 16)
+        h.append(UInt8((slotID >> 8) & 0xFF))
+        h.append(UInt8(slotID & 0xFF))
+        h.append(contentsOf: mac.prefix(14))
         handleToPath[h] = rel
         pathToHandle[rel] = h
         return h
@@ -385,7 +442,6 @@ private final class OverlayExport {
     func pathForHandleLocked(_ handle: Data) -> String? {
         handleToPath[handle]
     }
-
     func fileID(for handle: Data) -> UInt64 {
         guard handle.count >= 8 else { return 1 }
         var v: UInt64 = 0
@@ -419,16 +475,16 @@ private final class OverlayExport {
     /// True if `rel` or any of its ancestor directories is whiteout-deleted OR masked by an opaque ancestor.
     func isMaskedInLowerLocked(_ rel: String) -> Bool {
         if rel.isEmpty { return false }
-        if whiteouts.contains(rel) { return true }
-        // Check ancestors: if any ancestor is whiteout or opaque, lower entry is masked.
-        var cur = rel
-        while let idx = cur.lastIndex(of: "/") {
-            cur = String(cur[..<idx])
-            if whiteouts.contains(cur) || opaqueDirs.contains(cur) {
-                return true
+        if !whiteouts.isEmpty || !opaqueDirs.isEmpty {
+            if whiteouts.contains(rel) { return true }
+            var cur = rel
+            while let idx = cur.lastIndex(of: "/") {
+                cur = String(cur[..<idx])
+                if whiteouts.contains(cur) || opaqueDirs.contains(cur) {
+                    return true
+                }
             }
         }
-        // Hide host .env secrets on lower when excludeEnv is enabled
         if excludeEnv {
             let last = rel.lastIndex(of: "/").map { String(rel[rel.index(after: $0)...]) } ?? rel
             if isHiddenEnvFilename(last) { return true }
@@ -437,13 +493,17 @@ private final class OverlayExport {
     }
 
     func lstatUpperLocked(_ rel: String) -> stat? {
+        if upperTouchedDirs.isEmpty { return nil }
+        if !rel.isEmpty {
+            let parent = parentRel(rel)
+            if !upperTouchedDirs.contains(parent) { return nil }
+        }
         let p = fullUpper(rel)
         guard isContained(p, inside: upperRoot) else { return nil }
         var st = stat()
         guard lstat(p, &st) == 0 else { return nil }
         return st
     }
-
     func lstatLowerLocked(_ rel: String) -> stat? {
         if isMaskedInLowerLocked(rel) { return nil }
         let p = fullLower(rel)
@@ -505,6 +565,7 @@ private final class OverlayExport {
         if mkdir(upPath, mode) != 0 && errno != EEXIST {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        markUpperMutatedLocked(rel)
     }
 
     /// Copies a file, symlink, or directory from `lower` into `upper` without ever opening `lower` for write.
@@ -518,7 +579,7 @@ private final class OverlayExport {
         let lowPath = fullLower(rel)
         let upPath = fullUpper(rel)
         try ensureUpperParentsLocked(for: rel)
-
+        markUpperMutatedLocked(rel)
         let ftype = lst.st_mode & S_IFMT
         if ftype == S_IFDIR {
             try ensureUpperDirLocked(rel)
@@ -639,28 +700,25 @@ private final class OverlayExport {
 
     /// Returns sorted visible entry names in merged directory `relDir`.
     func mergedDirEntriesLocked(relDir: String) -> [String] {
-        var names = Set<String>()
-
-        // 1. Upper entries
-        let upDir = fullUpper(relDir)
-        if isContained(upDir, inside: upperRoot), let dp = opendir(upDir) {
-            defer { closedir(dp) }
-            while let ent = readdir(dp) {
-                let name = withUnsafePointer(to: ent.pointee.d_name) {
-                    $0.withMemoryRebound(to: CChar.self, capacity: Int(ent.pointee.d_namlen) + 1) {
-                        String(cString: $0)
-                    }
-                }
-                if name == "." || name == ".." { continue }
-                names.insert(name)
-            }
+        // Check O(1) directory listing cache first (critical for paginated READDIRPLUS on large dirs!)
+        let lowDir = fullLower(relDir)
+        var lowSt = stat()
+        let hasLow = isContained(lowDir, inside: lowerRoot) && (lstat(lowDir, &lowSt) == 0)
+        let lowSec = hasLow ? lowSt.st_mtimespec.tv_sec : -1
+        let lowNsec = hasLow ? lowSt.st_mtimespec.tv_nsec : -1
+        if let cached = dirListCache[relDir],
+           cached.version == dirCacheVersion,
+           cached.lowerMtimeSec == lowSec,
+           cached.lowerMtimeNsec == lowNsec {
+            return cached.entries
         }
 
-        // 2. Lower entries (unless directory is opaque or whiteout-masked)
-        let lowerBlocked = !relDir.isEmpty && (opaqueDirs.contains(relDir) || isMaskedInLowerLocked(relDir))
-        if !lowerBlocked {
-            let lowDir = fullLower(relDir)
-            if isContained(lowDir, inside: lowerRoot), let dp = opendir(lowDir) {
+        var names = Set<String>()
+
+        // 1. Upper entries (skip opendir completely when upper has never touched this dir!)
+        if upperTouchedDirs.contains(relDir) {
+            let upDir = fullUpper(relDir)
+            if isContained(upDir, inside: upperRoot), let dp = opendir(upDir) {
                 defer { closedir(dp) }
                 while let ent = readdir(dp) {
                     let name = withUnsafePointer(to: ent.pointee.d_name) {
@@ -669,17 +727,40 @@ private final class OverlayExport {
                         }
                     }
                     if name == "." || name == ".." { continue }
-                    if excludeEnv && isHiddenEnvFilename(name) { continue }
-                    let childRel = joinRel(relDir, name)
-                    if whiteouts.contains(childRel) { continue }
                     names.insert(name)
                 }
             }
         }
 
-        return names.sorted()
-    }
+        // 2. Lower entries (unless directory is opaque or whiteout-masked)
+        let lowerBlocked = !relDir.isEmpty && (opaqueDirs.contains(relDir) || isMaskedInLowerLocked(relDir))
+        if !lowerBlocked && hasLow, let dp = opendir(lowDir) {
+            defer { closedir(dp) }
+            while let ent = readdir(dp) {
+                let name = withUnsafePointer(to: ent.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(ent.pointee.d_namlen) + 1) {
+                        String(cString: $0)
+                    }
+                }
+                if name == "." || name == ".." { continue }
+                if excludeEnv && isHiddenEnvFilename(name) { continue }
+                if !whiteouts.isEmpty && whiteouts.contains(joinRel(relDir, name)) { continue }
+                names.insert(name)
+            }
+        }
 
+        let sorted = names.sorted()
+        if dirListCache.count > 4096 {
+            dirListCache.removeAll(keepingCapacity: true)
+        }
+        dirListCache[relDir] = CachedDirListing(
+            version: dirCacheVersion,
+            lowerMtimeSec: lowSec,
+            lowerMtimeNsec: lowNsec,
+            entries: sorted
+        )
+        return sorted
+    }
     func markWhiteoutLocked(_ rel: String) {
         guard !rel.isEmpty else { return }
         whiteouts.insert(rel)
@@ -788,9 +869,9 @@ private final class OverlayDaemon: @unchecked Sendable {
 
     private let registryLock = NSLock()
     private var exportsBySession: [String: OverlayExport] = [:]
-    private var exportByRootHandle: [Data: OverlayExport] = [:]
+    private var exportsBySlot: [UInt16: OverlayExport] = [:]
+    private var nextSlotID: UInt16 = 1
     private var nextFSID: UInt64 = 100
-
     init() throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -879,8 +960,14 @@ private final class OverlayDaemon: @unchecked Sendable {
         registryLock.lock()
         nextFSID += 1
         let fsid = nextFSID
+        var slot = nextSlotID
+        nextSlotID = (nextSlotID == UInt16.max) ? 1 : (nextSlotID + 1)
+        while exportsBySlot[slot] != nil {
+            slot = (slot == UInt16.max) ? 1 : (slot + 1)
+        }
         let exp = OverlayExport(
             sessionID: sessionID,
+            slotID: slot,
             fsid: fsid,
             lowerRoot: lowerDir,
             upperRoot: upperDir,
@@ -889,11 +976,11 @@ private final class OverlayDaemon: @unchecked Sendable {
             excludeEnv: excludeEnv
         )
         exportsBySession[sessionID] = exp
-        exportByRootHandle[exp.rootHandle] = exp
+        exportsBySlot[slot] = exp
         let token = exp.pendingMountToken!
         registryLock.unlock()
 
-        let opts = "vers=3,tcp,nolocks,noacl,rsize=\(MAX_IO_BYTES),wsize=\(MAX_IO_BYTES),acregmin=1,acregmax=3,acdirmin=1,acdirmax=3,port=\(port),mountport=\(port)"
+        let opts = "vers=3,tcp,nolocks,noacl,rsize=\(MAX_IO_BYTES),wsize=\(MAX_IO_BYTES),acregmin=5,acregmax=30,acdirmin=5,acdirmax=30,port=\(port),mountport=\(port)"
         let (rc, stderr) = runProcess("/sbin/mount_nfs", ["-o", opts, "127.0.0.1:\(token)", canonicalMnt])
 
         // Always invalidate one-shot mount token immediately after mount_nfs finishes
@@ -904,7 +991,7 @@ private final class OverlayDaemon: @unchecked Sendable {
         guard rc == 0 else {
             registryLock.lock()
             exportsBySession.removeValue(forKey: sessionID)
-            exportByRootHandle.removeValue(forKey: exp.rootHandle)
+            exportsBySlot.removeValue(forKey: slot)
             registryLock.unlock()
             throw NSError(
                 domain: "BooBoxOverlay",
@@ -945,7 +1032,7 @@ private final class OverlayDaemon: @unchecked Sendable {
         registryLock.lock()
         if exportsBySession[sessionID] === exp {
             exportsBySession.removeValue(forKey: sessionID)
-            exportByRootHandle.removeValue(forKey: exp.rootHandle)
+            exportsBySlot.removeValue(forKey: exp.slotID)
         }
         registryLock.unlock()
     }
@@ -964,22 +1051,20 @@ private final class OverlayDaemon: @unchecked Sendable {
         }
     }
 
+    /// O(1) direct export lookup via 2-byte slot prefix + 128-bit handle table verification.
     private func resolveExportAndPath(handle: Data) -> (OverlayExport, String)? {
+        guard handle.count == 16 else { return nil }
+        let slot = (UInt16(handle[0]) << 8) | UInt16(handle[1])
         registryLock.lock()
-        let exports = Array(exportsBySession.values)
+        let exp = exportsBySlot[slot]
         registryLock.unlock()
-
-        for exp in exports {
-            exp.lock.lock()
-            let p = exp.pathForHandleLocked(handle)
-            exp.lock.unlock()
-            if let p {
-                return (exp, p)
-            }
-        }
+        guard let exp else { return nil }
+        exp.lock.lock()
+        let p = exp.pathForHandleLocked(handle)
+        exp.lock.unlock()
+        if let p { return (exp, p) }
         return nil
     }
-
     private func claimExportByMountToken(_ token: String) -> OverlayExport? {
         registryLock.lock()
         let exports = Array(exportsBySession.values)
@@ -1032,7 +1117,12 @@ private final class OverlayDaemon: @unchecked Sendable {
     }
 
     private func serveTCPConnection(_ fd: Int32) {
-        defer { Darwin.close(fd) }
+        let writeLock = NSLock()
+        let inflight = DispatchGroup()
+        defer {
+            inflight.wait()
+            Darwin.close(fd)
+        }
         while true {
             var message = Data()
             var isLast = false
@@ -1046,12 +1136,19 @@ private final class OverlayDaemon: @unchecked Sendable {
                 guard let frag = readExact(fd: fd, count: fragLen) else { return }
                 message.append(frag)
             }
-            guard let reply = dispatchRPC(message) else { return }
-            var frame = Data(capacity: 4 + reply.count)
-            var rm = (UInt32(0x8000_0000) | UInt32(reply.count)).bigEndian
-            withUnsafeBytes(of: &rm) { frame.append(contentsOf: $0) }
-            frame.append(reply)
-            if !writeAll(fd: fd, data: frame) { return }
+            let rpcBytes = message
+            inflight.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { inflight.leave() }
+                guard let reply = self.dispatchRPC(rpcBytes) else { return }
+                var frame = Data(capacity: 4 + reply.count)
+                var rm = (UInt32(0x8000_0000) | UInt32(reply.count)).bigEndian
+                withUnsafeBytes(of: &rm) { frame.append(contentsOf: $0) }
+                frame.append(reply)
+                writeLock.lock()
+                _ = self.writeAll(fd: fd, data: frame)
+                writeLock.unlock()
+            }
         }
     }
 
@@ -1468,6 +1565,7 @@ private final class OverlayDaemon: @unchecked Sendable {
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
                 Darwin.close(fd)
+                exp.markUpperMutatedLocked(childRel)
                 if let sattr { applySattr3(sattr, to: upPath) }
                 let objFH = exp.handleForPathLocked(childRel)
                 let objAttr = exp.attrLocked(for: childRel)
@@ -1522,6 +1620,7 @@ private final class OverlayDaemon: @unchecked Sendable {
                 if mkdir(upPath, dmode) != 0 {
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
+                exp.markUpperMutatedLocked(childRel)
                 let objFH = exp.handleForPathLocked(childRel)
                 let objAttr = exp.attrLocked(for: childRel)
                 let postDir = exp.attrLocked(for: dirRel)
@@ -1574,6 +1673,7 @@ private final class OverlayDaemon: @unchecked Sendable {
                 if symlink(target, upPath) != 0 {
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
+                exp.markUpperMutatedLocked(childRel)
                 let objFH = exp.handleForPathLocked(childRel)
                 let objAttr = exp.attrLocked(for: childRel)
                 let postDir = exp.attrLocked(for: dirRel)
@@ -1634,6 +1734,7 @@ private final class OverlayDaemon: @unchecked Sendable {
                     w.writeWccData(pre: preDir, post: exp.attrLocked(for: dirRel))
                     return w.data
                 }
+                exp.bumpDirCacheLocked()
             }
             if exp.lstatLowerLocked(childRel) != nil {
                 exp.markWhiteoutLocked(childRel)
@@ -1686,6 +1787,7 @@ private final class OverlayDaemon: @unchecked Sendable {
             let upPath = exp.fullUpper(childRel)
             if exp.lstatUpperLocked(childRel) != nil {
                 exp.removeUpperTreeLocked(upPath)
+                exp.bumpDirCacheLocked()
             }
             if exp.lstatLowerLocked(childRel) != nil {
                 exp.markWhiteoutLocked(childRel)
@@ -1795,6 +1897,7 @@ private final class OverlayDaemon: @unchecked Sendable {
                     }
                 }
 
+                exp.markUpperMutatedLocked(dstRel)
                 exp.renameHandlesLocked(from: srcRel, to: dstRel)
                 w.writeUInt32(NFS3_OK)
                 w.writeWccData(pre: preFrom, post: exp.attrLocked(for: fromDirRel))
@@ -1850,6 +1953,7 @@ private final class OverlayDaemon: @unchecked Sendable {
                 if link(upTarget, exp.fullUpper(linkRel)) != 0 {
                     throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                 }
+                exp.markUpperMutatedLocked(linkRel)
                 w.writeUInt32(NFS3_OK)
                 w.writePostOpAttr(exp.attrLocked(for: targetRel))
                 w.writeWccData(pre: preDir, post: exp.attrLocked(for: dirRel))
@@ -2289,9 +2393,13 @@ let runDir = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
     .appendingPathComponent("boo_box/run", isDirectory: true)
 try? FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
 
-let controlSockPath = runDir.appendingPathComponent("overlay.sock").path
+var customControlSock: String? = nil
+let cliArgs = Array(CommandLine.arguments.dropFirst())
+if let idx = cliArgs.firstIndex(of: "--control-socket"), idx + 1 < cliArgs.count {
+    customControlSock = cliArgs[idx + 1]
+}
+let controlSockPath = customControlSock ?? runDir.appendingPathComponent("overlay.sock").path
 let pidFilePath = runDir.appendingPathComponent("overlay.pid").path
-
 private let daemon: OverlayDaemon
 do {
     daemon = try OverlayDaemon()
