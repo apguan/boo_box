@@ -255,6 +255,23 @@ final class GhosttyRuntime {
 
         case GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE:
             return onHostAction?(.toggleCommandPalette, targetSurfaceView) ?? false
+
+        case GHOSTTY_ACTION_START_SEARCH:
+            let needle = action.action.start_search.needle.map { String(cString: $0) }
+            targetSurfaceView?.handleStartSearch(needle: needle)
+            return true
+
+        case GHOSTTY_ACTION_END_SEARCH:
+            targetSurfaceView?.handleEndSearch()
+            return true
+
+        case GHOSTTY_ACTION_SEARCH_TOTAL:
+            targetSurfaceView?.handleSearchTotal(Int(action.action.search_total.total))
+            return true
+
+        case GHOSTTY_ACTION_SEARCH_SELECTED:
+            targetSurfaceView?.handleSearchSelected(Int(action.action.search_selected.selected))
+            return true
         case GHOSTTY_ACTION_MOUSE_SHAPE:
             targetSurfaceView?.handleMouseShape(action.action.mouse_shape)
             return true

@@ -356,6 +356,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         editMenu.addItem(withTitle: "Paste", action: #selector(TerminalSurfaceView.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(TerminalSurfaceView.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Find in Terminal…", action: #selector(findInTerminal(_:)), keyEquivalent: "f")
+        editMenu.addItem(withTitle: "Find Next", action: #selector(findNextInTerminal(_:)), keyEquivalent: "g")
+        let findPrev = editMenu.addItem(withTitle: "Find Previous", action: #selector(findPreviousInTerminal(_:)), keyEquivalent: "g")
+        findPrev.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Clear Screen", action: #selector(clearActiveScreen(_:)), keyEquivalent: "k")
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
@@ -509,6 +514,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func toggleCommandPalette(_ sender: Any?) {
         store?.toggleCommandPalette()
+    }
+
+    @objc private func findInTerminal(_ sender: Any?) {
+        store?.openTerminalSearch()
+    }
+
+    @objc private func findNextInTerminal(_ sender: Any?) {
+        store?.navigateTerminalSearch(next: true)
+    }
+
+    @objc private func findPreviousInTerminal(_ sender: Any?) {
+        store?.navigateTerminalSearch(next: false)
     }
 
     private func showSettingsWindow() {

@@ -33,8 +33,13 @@ final class TerminalSurfaceView: NSView {
     var onBell: (() -> Void)?
     var onDesktopNotification: ((String, String) -> Void)?
     var onCommandFinished: ((Int, UInt64) -> Void)?
+    var onStartSearch: ((String?) -> Void)?
+    var onEndSearch: (() -> Void)?
+    var onSearchTotal: ((Int?) -> Void)?
+    var onSearchSelected: ((Int?) -> Void)?
     var onFocusChange: ((Bool) -> Void)?
     var onChildExited: ((UInt32) -> Void)?
+
     private(set) var isFocused: Bool = false
     private(set) var cellSize: CGSize = CGSize(width: 8, height: 16)
     private var markedText = NSMutableAttributedString()
@@ -753,6 +758,22 @@ final class TerminalSurfaceView: NSView {
 
     func handleCommandFinished(exitCode: Int, durationNs: UInt64) {
         onCommandFinished?(exitCode, durationNs)
+    }
+
+    func handleStartSearch(needle: String?) {
+        onStartSearch?(needle)
+    }
+
+    func handleEndSearch() {
+        onEndSearch?()
+    }
+
+    func handleSearchTotal(_ total: Int) {
+        onSearchTotal?(total >= 0 ? total : nil)
+    }
+
+    func handleSearchSelected(_ selected: Int) {
+        onSearchSelected?(selected >= 0 ? selected : nil)
     }
     func handleMouseShape(_ shape: ghostty_action_mouse_shape_e) {
         currentCursor = GhosttyInput.cursor(for: shape)

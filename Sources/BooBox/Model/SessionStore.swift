@@ -70,10 +70,13 @@ final class TerminalPane: ObservableObject, Identifiable {
     var onBell: (() -> Void)?
     var onDesktopNotification: ((String, String) -> Void)?
     var onCommandFinished: ((Int, UInt64) -> Void)?
+    var onStartSearch: ((String?) -> Void)?
+    var onEndSearch: (() -> Void)?
+    var onSearchTotal: ((Int?) -> Void)?
+    var onSearchSelected: ((Int?) -> Void)?
     var onBecameFocused: (() -> Void)?
     var onTitleChange: ((String) -> Void)?
     var onPwdChange: ((String) -> Void)?
-
     init(launchOptions: SurfaceLaunchOptions = SurfaceLaunchOptions(), daemonPaneID: String? = nil) {
         let paneID = UUID()
         self.id = paneID
@@ -99,6 +102,18 @@ final class TerminalPane: ObservableObject, Identifiable {
         }
         self.surfaceView.onCommandFinished = { [weak self] exitCode, durationNs in
             self?.onCommandFinished?(exitCode, durationNs)
+        }
+        self.surfaceView.onStartSearch = { [weak self] needle in
+            self?.onStartSearch?(needle)
+        }
+        self.surfaceView.onEndSearch = { [weak self] in
+            self?.onEndSearch?()
+        }
+        self.surfaceView.onSearchTotal = { [weak self] total in
+            self?.onSearchTotal?(total)
+        }
+        self.surfaceView.onSearchSelected = { [weak self] selected in
+            self?.onSearchSelected?(selected)
         }
         self.surfaceView.onFocusChange = { [weak self] focused in
             guard let self else { return }
@@ -412,6 +427,11 @@ final class SessionStore: ObservableObject {
     @Published var cloningProjectName: String?
     @Published var configuringTarget: SandboxConfigTarget?
     @Published var isCommandPaletteOpen: Bool = false
+    @Published var isTerminalSearchOpen: Bool = false
+    @Published var terminalSearchQuery: String = ""
+    @Published var terminalSearchTotal: Int? = nil
+    @Published var terminalSearchSelected: Int? = nil
+    @Published var terminalSearchFocusToken: Int = 0
     let stageView = TerminalStageView()
     var onOpenSettings: (() -> Void)?
     var onThemeBackgroundChanged: ((NSColor) -> Void)?
@@ -1099,6 +1119,9 @@ final class SessionStore: ObservableObject {
     }
     func selectSession(_ id: UUID) {
         guard let session = sessions.first(where: { $0.id == id }) else { return }
+        if selectedSessionID != id && isTerminalSearchOpen {
+            closeTerminalSearch(refocusTerminal: false)
+        }
         selectedSessionID = id
         session.hasUnreadBell = false
         updateDockBadge()
@@ -1388,6 +1411,61 @@ final class SessionStore: ObservableObject {
         refocusActiveTerminal()
     }
 
+    // MARK: - In-Terminal Find (`⌘F` / `⌘G` / `⇧⌘G`) Powered by libghostty
+
+    func openTerminalSearch(initialNeedle: String? = nil, fromGhosttyAction: Bool = false) {
+        guard let surfaceView = selectedSession?.focusedPane?.surfaceView else { return }
+        isCommandPaletteOpen = false
+        if !isTerminalSearchOpen {
+            isTerminalSearchOpen = true
+            if !fromGhosttyAction {
+                _ = surfaceView.performBindingAction("start_search")
+            }
+        }
+        if let needle = initialNeedle, !needle.isEmpty {
+            terminalSearchQuery = needle
+            if !fromGhosttyAction {
+                _ = surfaceView.performBindingAction("search:\(needle)")
+            }
+        } else if !terminalSearchQuery.isEmpty && !fromGhosttyAction {
+            _ = surfaceView.performBindingAction("search:\(terminalSearchQuery)")
+        }
+        terminalSearchFocusToken += 1
+    }
+
+    func updateTerminalSearchQuery(_ query: String) {
+        terminalSearchQuery = query
+        guard let surfaceView = selectedSession?.focusedPane?.surfaceView else { return }
+        if query.isEmpty {
+            terminalSearchTotal = nil
+            terminalSearchSelected = nil
+            _ = surfaceView.performBindingAction("search:")
+        } else {
+            _ = surfaceView.performBindingAction("search:\(query)")
+        }
+    }
+
+    func navigateTerminalSearch(next: Bool) {
+        guard let surfaceView = selectedSession?.focusedPane?.surfaceView else { return }
+        if !isTerminalSearchOpen {
+            openTerminalSearch()
+            return
+        }
+        _ = surfaceView.performBindingAction(next ? "navigate_search:next" : "navigate_search:previous")
+    }
+
+    func closeTerminalSearch(refocusTerminal: Bool = true) {
+        if let surfaceView = selectedSession?.focusedPane?.surfaceView {
+            _ = surfaceView.performBindingAction("end_search")
+        }
+        isTerminalSearchOpen = false
+        terminalSearchTotal = nil
+        terminalSearchSelected = nil
+        if refocusTerminal {
+            refocusActiveTerminal()
+        }
+    }
+
     // MARK: - 1-Click Proxy Blocked-Domain / Leak Toast Actions
 
     func allowBlockedDomainForSession(_ domain: String, sessionID: UUID) {
@@ -1675,6 +1753,26 @@ final class SessionStore: ObservableObject {
                     body: msg
                 )
             }
+        }
+
+        pane.onStartSearch = { [weak self, weak session] needle in
+            guard let self, let session, self.selectedSessionID == session.id else { return }
+            self.openTerminalSearch(initialNeedle: needle, fromGhosttyAction: true)
+        }
+        pane.onEndSearch = { [weak self, weak session] in
+            guard let self, let session, self.selectedSessionID == session.id else { return }
+            self.isTerminalSearchOpen = false
+            self.terminalSearchTotal = nil
+            self.terminalSearchSelected = nil
+            self.refocusActiveTerminal()
+        }
+        pane.onSearchTotal = { [weak self, weak session] total in
+            guard let self, let session, self.selectedSessionID == session.id else { return }
+            self.terminalSearchTotal = total
+        }
+        pane.onSearchSelected = { [weak self, weak session] selected in
+            guard let self, let session, self.selectedSessionID == session.id else { return }
+            self.terminalSearchSelected = selected
         }
 
         pane.onBecameFocused = { [weak self, weak session, weak pane] in

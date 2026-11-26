@@ -70,11 +70,17 @@ struct MainWorkspaceView: View {
                 ProxyAlertBanner(store: store, session: session, alert: alert)
             }
 
-            ZStack {
+            ZStack(alignment: .topTrailing) {
                 TerminalStageRepresentable(stageView: store.stageView)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .opacity(activeSession == nil ? 0 : 1)
                     .allowsHitTesting(activeSession != nil)
+
+                if activeSession != nil && store.isTerminalSearchOpen {
+                    TerminalSearchBar(store: store)
+                        .padding(.top, 10)
+                        .padding(.trailing, 14)
+                }
 
                 if activeSession == nil {
                     EmptyWorkspaceView(store: store)
@@ -230,6 +236,184 @@ private struct ProxyAlertBanner: View {
         .background((isLeak ? Color.red : Color.orange).opacity(isLeak ? 0.16 : 0.11))
         .overlay(alignment: .bottom) {
             Divider().opacity(0.4)
+        }
+    }
+}
+
+private struct TerminalSearchBar: View {
+    @ObservedObject var store: SessionStore
+
+    private var matchLabel: String {
+        let q = store.terminalSearchQuery
+        guard !q.isEmpty else { return "" }
+        guard let total = store.terminalSearchTotal else { return "" }
+        if total == 0 { return "0/0" }
+        if let sel = store.terminalSearchSelected {
+            return "\(sel + 1)/\(total)"
+        }
+        return "\(total)"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            TerminalFindTextField(
+                text: Binding(
+                    get: { store.terminalSearchQuery },
+                    set: { store.updateTerminalSearchQuery($0) }
+                ),
+                focusToken: store.terminalSearchFocusToken,
+                placeholder: "Find in terminal…",
+                onNext: { store.navigateTerminalSearch(next: true) },
+                onPrevious: { store.navigateTerminalSearch(next: false) },
+                onClose: { store.closeTerminalSearch() }
+            )
+            .frame(width: 190, height: 20)
+
+            if !matchLabel.isEmpty {
+                Text(matchLabel)
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(store.terminalSearchTotal == 0 ? Color.red.opacity(0.85) : Color.secondary)
+                    .fixedSize()
+            }
+
+            Divider()
+                .frame(height: 14)
+                .opacity(0.4)
+
+            Button {
+                store.navigateTerminalSearch(next: false)
+            } label: {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Previous Match (⇧⌘G)")
+
+            Button {
+                store.navigateTerminalSearch(next: true)
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Next Match (⌘G)")
+
+            Button {
+                store.closeTerminalSearch()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Close Find (Esc)")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThickMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.16), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.28), radius: 12, y: 4)
+    }
+}
+
+private struct TerminalFindTextField: NSViewRepresentable {
+    @Binding var text: String
+    let focusToken: Int
+    let placeholder: String
+    let onNext: () -> Void
+    let onPrevious: () -> Void
+    let onClose: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> FindAutoFocusField {
+        let field = FindAutoFocusField()
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = NSFont.systemFont(ofSize: 12.5)
+        field.placeholderString = placeholder
+        field.usesSingleLineMode = true
+        field.lineBreakMode = .byTruncatingTail
+        field.delegate = context.coordinator
+        field.stringValue = text
+        return field
+    }
+
+    func updateNSView(_ nsView: FindAutoFocusField, context: Context) {
+        context.coordinator.parent = self
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+        if nsView.lastFocusToken != focusToken {
+            nsView.lastFocusToken = focusToken
+            nsView.claimFocus(selectAll: true)
+        }
+    }
+
+    final class FindAutoFocusField: NSTextField {
+        var lastFocusToken: Int = -1
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            claimFocus(selectAll: true)
+        }
+
+        func claimFocus(selectAll: Bool) {
+            guard let win = window else { return }
+            DispatchQueue.main.async { [weak self, weak win] in
+                guard let self, let win else { return }
+                win.makeFirstResponder(self)
+                if selectAll, let editor = self.currentEditor() {
+                    editor.selectAll(nil)
+                }
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: TerminalFindTextField
+
+        init(parent: TerminalFindTextField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            switch commandSelector {
+            case #selector(NSResponder.insertNewline(_:)):
+                if NSEvent.modifierFlags.contains(.shift) {
+                    parent.onPrevious()
+                } else {
+                    parent.onNext()
+                }
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                parent.onClose()
+                return true
+            default:
+                return false
+            }
         }
     }
 }
