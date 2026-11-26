@@ -20,9 +20,10 @@ Running autonomous coding agents directly on your host shell gives them full acc
   - Three outbound network policies (`Full (Vault Protected)`, `Dev Allowlist`, `Offline (Air-gapped)`), enforced at the kernel level via Seatbelt + direct DNS (`/var/run/mDNSResponder`) blocking.
 - **Per-Sandbox Overrides (`⌥⌘,` or sidebar `…` popup):** Override network policy, Vault secret subsets, env vars, shared toolchains, host capabilities, per-process kernel `rlimit` / `nice` caps, and Private VM vCPU / RAM / NAT-or-Offline / VirtioFS `/mnt/host` shares individually per session.
 - **Global Sandbox Environment (`~/boo_box/env`):** Run arbitrary install scripts (`curl … | sh`, `npm i -g`, `bun add -g`, `uv tool install`, `go install`, `cargo install`, etc.) inside Seatbelt targeting `~/boo_box/env`, with automatic executable directory discovery added to sandbox `PATH` across all sessions.
-- **Fast APFS Cloning & Zero-Hang Lifecycle:**
-  - `boobox-clone` uses kernel `clonefile(2)` (`0` extra SSD blocks) + warm pool + Git delta sync + `<1 ms` Unix domain socket IPC (`~/boo_box/run/app.sock`).
-  - Deleting saved/active sessions and running `rm -rf <dir>` inside sandboxes (via the read-only `~/.boobox-bin/rm` shim) both use atomic APFS move-aside + detached background reaping (`<5 ms` even for 300k-file `node_modules`; opt out with `BOOBOX_SYNC_RM=1`).
+- **O(1) Instant CoW Overlay (`boobox-overlay`) & Zero-Hang Lifecycle:**
+  - Default workspace engine (`boobox-overlay`) mounts any folder — even multi-million-file monorepos or multi-repo directories — in **`~20 ms`** via unprivileged localhost NFSv3 Copy-on-Write (`O_RDONLY` host lower layer + isolated `.overlay/upper/` + whiteouts, Seatbelt-blocked localhost port, 128-bit crypto handles, zero `sudo`/kexts).
+  - Optional **APFS Full Clone** (`--clone` / `--full` / `--slim`, or in `Settings → General`) uses `boobox-clone` + kernel `clonefile(2)` + warm pool + Git delta sync for a frozen point-in-time snapshot.
+  - Deleting saved/active sessions and running `rm -rf <dir>` inside sandboxes both use atomic move-aside + detached background reaping (`<5 ms`).
 
 
 ## First-Time Setup (Recommended: Let Your Agent Do It)
@@ -102,17 +103,17 @@ Make sure `~/.local/bin` is on your host shell `PATH` to use the `boo` CLI from 
 ## CLI Usage (`boo`)
 
 ```bash
-# Open a zero-copy APFS sandbox clone of the current project (all files incl. node_modules, 0 extra SSD bytes)
+# Open an instant O(1) ~20 ms CoW overlay sandbox for the current directory (works on 1M+ file trees)
 boo
 boo .
 boo /path/to/repo
 
-# Clone options
-boo --no-env .            # Exclude .env / .env.* secret files (keeps .env.example)
-boo --slim .              # Skip node_modules & gitignored build caches
-boo --full .              # Clone all files (default)
+# Workspace isolation options
+boo --no-env .            # Hide host .env / .env.* secret files (keeps .env.example)
+boo --overlay .           # Force instant O(1) ~20 ms CoW overlay mount (default)
+boo --clone / --full .    # Force frozen APFS full clone (including node_modules)
+boo --slim .              # Force frozen APFS slim clone (skip node_modules & caches)
 boo --scratch             # Open an empty scratch sandbox session
-
 # Global Sandbox Environment (~/boo_box/env — shared across all sandboxes)
 boo env run '<script>'    # Run any install script inside Seatbelt with HOME=~/boo_box/env
 boo env shell             # Open an interactive sandboxed shell targeting ~/boo_box/env
