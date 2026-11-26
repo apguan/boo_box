@@ -33,7 +33,7 @@ Because `boo_box` runs every tab inside a strict macOS Seatbelt sandbox (kernel-
 
 > **Read `SETUP_COOKBOOK.md` in this repo, walk me through the setup questions, and configure `boo_box` for my Mac.**
 
-You can also configure accounts, CLIs, and 1-click MCP servers visually anytime inside **`Settings (⌘,) → Connections`**, or read **[`SETUP_COOKBOOK.md`](./SETUP_COOKBOOK.md)** directly for every recipe and sandbox gotcha.
+You can also sign into **GitHub, Notion, Linear, Vercel, Supabase, Stripe, Sentry, and Cloudflare** with **1-click browser OAuth** inside **`Settings (⌘,) → Connections`** (zero API key pasting; tokens stay in macOS Keychain and sync directly into OMP, OpenCode, Claude Code, Codex, and Gemini CLI), or read **[`SETUP_COOKBOOK.md`](./SETUP_COOKBOOK.md)** for every recipe and sandbox gotcha.
 ---
 
 ## Architecture

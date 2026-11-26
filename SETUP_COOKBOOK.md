@@ -40,44 +40,30 @@ boo setup-github --status 2>/dev/null || true
 boo tools 2>/dev/null || true
 ```
 
-### Step B — Ask the User These 5 Setup Questions
+### Step B — Ask the User These 4 Quick Setup Questions
 Present concise choices with clear security tradeoffs (use your harness's question UI or a short numbered prompt):
+1. **1-Click Browser OAuth Connections (`Settings (⌘,) → Connections`):**
+   - **GitHub:** Click **`Connect`** (or run `boo setup-github --from-gh`) — uses existing host `gh` OAuth instantly or launches GitHub browser OAuth (`gh auth login --web`), saves to macOS Keychain, and wires `git push` + `gh` + GitHub MCP across every sandbox. *(Optional: expand **Advanced** or run `boo setup-github --token <pat>` if the user prefers a repo-scoped fine-grained PAT or SSH Agent forwarding.)*
+   - **Workspace & Cloud Apps (Native OAuth 2.1 + PKCE + Dynamic Client Registration):** Click **`Connect`** on **Notion**, **Linear**, **Vercel**, **Supabase**, **Stripe**, **Sentry**, or **Cloudflare** — opens the official browser OAuth consent page directly, exchanges tokens via loopback `127.0.0.1`, stores them in macOS Keychain (`dev.boo-box.oauth`), and writes native OAuth credentials straight into **OMP** (`~/.omp/agent/agent.db`), **OpenCode** (`~/.local/share/opencode/mcp-auth.json`), and selected agent MCP configs (**Claude Code**, **Codex**, **Gemini CLI**). Zero API keys or manual copy-pasting!
 
-1. **GitHub & `git push` inside sandboxes:**
-   - **Option 1 (Recommended — Scoped Fine-Grained PAT):** Create a repo-scoped PAT (`Contents` + `Pull requests` RW) at `https://github.com/settings/personal-access-tokens/new`, then run `boo setup-github --token <pat>` (stored encrypted in macOS Keychain).
-   - **Option 2 (Fastest — Reuse Host `gh` CLI Login):** Run `boo setup-github --from-gh` (imports your existing `gh auth token` into Keychain, configures `~/.gitconfig` + `gh auth setup-git`; carries your full host `gh` scopes).
-   - **Option 3 (SSH Agent Forwarding):** Enable `Allow Host SSH Agent` + `Allow Read-Only Host ~/.gitconfig` in `Settings → Sandbox Access` (private keys never enter the sandbox; requires SSH remotes or `insteadOf`).
-   - **Option 4 (Read-Only / No Push):** Skip GitHub auth — sandboxes cannot push commits or create PRs.
+2. **Instant Tools (No Login Required):**
+   - Enable **Context7**, **Cloudflare Docs**, **Playwright**, **Sequential Thinking**, **Figma**, or **Slack** in 1 click inside **`Settings → Connections → Instant Tools & Docs`**.
 
-2. **LLM Provider API Keys (Proxy-Protected Phantom Tokens):**
-   - Which providers do you use via API keys (**Anthropic**, **OpenAI**, **OpenRouter**, **Gemini**)?
-   - Direct the user to paste keys in **`Settings (⌘,) → Connections → LLM Providers`** (or **`Secrets & Network`**). Real keys stay strictly on the host in Keychain; sandboxes only receive worthless `bbx_ph_...` phantom tokens swapped by `boobox-proxy` on bound provider hosts.
-   - *(Note: if the user authenticates their coding agent via OAuth — e.g. Claude/OMP/Codex login — their shared agent config folder in `Settings → Sandbox Access` already carries auth automatically.)*
+3. **LLM Provider Auth:**
+   - If the user uses OAuth logins inside their coding agent (Claude / OMP / Codex / OpenCode), enabling their agent config folder in **`Settings → Sandbox Access`** carries auth automatically.
+   - If the user uses raw LLM API keys (**Anthropic**, **OpenAI**, **OpenRouter**, **Gemini**), expand **`Settings → Connections → Advanced: LLM API Keys & Manual Tokens`** so keys stay in Keychain and sandboxes only ever receive worthless `bbx_ph_…` phantom tokens swapped by `boobox-proxy`.
 
-3. **Cloud & Dev CLIs (Keychain-Backed):**
-   - Which extra CLIs do you use inside sandboxes?
-   - Supported 1-click in **`Settings (⌘,) → Connections → Apps & CLIs`**: **Cloudflare (`wrangler`)**, **Vercel** (supports 1-click local import), **Supabase**, **Linear**, **Stripe**, **Sentry**, **Slack**, **npm** (supports `~/.npmrc` import), **Fly.io** (supports `~/.fly/config.yml` import), **Exa**, **Context7**, **Firecrawl**.
-
-4. **MCP Servers (1-Click Multi-Agent Sync):**
-   - Which MCP servers do you want synced into your installed coding agents (**OMP**, **OpenCode**, **Claude Code**, **Codex**, **Gemini CLI**)?
-   - Built-in 1-click catalog in **`Settings (⌘,) → Connections → MCP Servers`**:
-     - **OAuth HTTP (browser login, persisted via shared `~/.mcp-auth`):** Notion, Linear, Slack, Figma, Sentry, Cloudflare Docs, Supabase, Vercel, Stripe, Context7, OpenRouter.
-     - **Local Stdio (`npx`):** GitHub MCP, Playwright, Exa Search, Sequential Thinking.
-
-5. **Outbound Network Posture & Global Sandbox Tools:**
-   - **Network mode (`Settings → Secrets & Network`):**
-     - `Full (Vault Protected)` *(default — unrestricted dev traffic, LLM keys still protected by phantom tokens)*
-     - `Dev Allowlist` *(locks Seatbelt to `boobox-proxy` + curated LLM/npm/PyPI/GitHub/Cloudflare domains; blocked requests pop a 1-click **`Allow (this tab)` / `Allow globally`** toast in the tab header)*
-     - `Offline (Air-gapped)` *(blocks all remote traffic)*
-   - **Global Sandbox Toolchains (`~/boo_box/env`):** Want to install any sandbox-writable CLIs via `boo env run '<install-cmd>'` (e.g. `bun`, `uv`, `omp`, `claude`, `codex`) so they can self-update without touching read-only `/opt/homebrew`?
+4. **Outbound Network Posture & Global Sandbox Tools:**
+   - **Network mode (`Settings → Secrets & Network`):** `Full (Vault Protected)` *(default)*, `Dev Allowlist` *(locks Seatbelt to `boobox-proxy` + curated dev domains; blocked hosts pop a 1-click Allow toast in the tab header)*, or `Offline (Air-gapped)`.
+   - **Global Sandbox Toolchains (`~/boo_box/env`):** Install any sandbox-writable CLIs via `boo env run '<install-cmd>'` so they can self-update without touching read-only `/opt/homebrew`.
 
 ### Step C — Apply Approved Configuration & Verify
-- **GitHub (if chosen):**
+- **GitHub (if chosen via CLI instead of clicking `Connect` in Settings):**
   ```bash
-  # Option 1 (fine-grained PAT — ask user to run or pass via env so it stays out of chat logs):
-  boo setup-github
-  # Option 2 (one-shot import from host `gh`):
+  # One-shot OAuth import from host `gh`:
   boo setup-github --from-gh
+  # Or interactive scoped PAT:
+  boo setup-github
   ```
 - **Verify inside a fresh sandbox tab (`⌘T` or `boo .`):**
   ```bash
