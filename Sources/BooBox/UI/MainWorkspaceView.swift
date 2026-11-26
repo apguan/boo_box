@@ -459,21 +459,37 @@ private struct EmptyWorkspaceView: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            SoftPillButton(
-                title: "New Session",
-                systemName: "plus",
-                shortcut: "⌘T",
-                tint: Color.primary.opacity(0.9),
-                hoverTint: .primary,
-                baseFill: Color.primary.opacity(0.08),
-                hoverFill: Color.primary.opacity(0.14),
-                helpText: "New Sandboxed Session (⌘T)"
-            ) {
-                store.newSession(mode: .sandbox)
-            }
-            .frame(width: 170)
+            HStack(spacing: 10) {
+                SoftPillButton(
+                    title: "New Session",
+                    systemName: "plus",
+                    shortcut: "⌘T",
+                    tint: Color.primary.opacity(0.9),
+                    hoverTint: .primary,
+                    baseFill: Color.primary.opacity(0.08),
+                    hoverFill: Color.primary.opacity(0.14),
+                    helpText: "New Sandboxed Session (⌘T)"
+                ) {
+                    store.newSession(mode: .sandbox)
+                }
+                .frame(width: 165)
 
-            Text("⌘T new session · ⇧⌘N private VM · ⌥⌘T host shell")
+                SoftPillButton(
+                    title: "Open Folder…",
+                    systemName: "folder.badge.plus",
+                    shortcut: "⇧⌘O",
+                    tint: Color(red: 0.25, green: 0.84, blue: 0.72),
+                    hoverTint: Color(red: 0.25, green: 0.84, blue: 0.72),
+                    baseFill: Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.10),
+                    hoverFill: Color(red: 0.25, green: 0.84, blue: 0.72).opacity(0.18),
+                    helpText: "Choose a host folder to open in an isolated sandbox (⇧⌘O)"
+                ) {
+                    store.openProjectFolderPicker()
+                }
+                .frame(width: 175)
+            }
+
+            Text("⌘T new session · ⇧⌘O open folder · ⇧⌘N private VM · ⌥⌘T host shell")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }
@@ -731,8 +747,9 @@ private struct SessionHeaderBar: View {
 
     private var vmPillText: String {
         if session.mode == .sandbox {
-            if let shortID = session.macSandbox?.shortID {
-                return "sandbox · \(shortID)"
+            if let sb = session.macSandbox {
+                let prefix = sb.isOverlay ? "overlay" : "sandbox"
+                return "\(prefix) · \(sb.shortID)"
             }
             return "sandbox"
         }
@@ -753,6 +770,9 @@ private struct SessionHeaderBar: View {
 
     private var vmTooltip: String {
         if session.mode == .sandbox, let sb = session.macSandbox {
+            if sb.isOverlay {
+                return "Instant CoW Overlay (Seatbelt + O_RDONLY host lower) — edits stay isolated in ~/boo_box/sessions/\(sb.shortID)/.overlay/; source folder is never modified"
+            }
             return "macOS kernel sandbox (Seatbelt) — files persist in \(sb.shortDisplayPath); real $HOME & outside writes blocked"
         }
         switch session.vmState {

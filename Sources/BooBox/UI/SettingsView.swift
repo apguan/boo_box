@@ -444,7 +444,7 @@ private struct SecretsNetworkSettingsTab: View {
             VStack(alignment: .leading, spacing: 18) {
                 SettingsHeader(
                     title: "Secrets & Network",
-                    subtitle: "Keep real API keys on your host in Keychain or 1Password while sandboxes only ever see worthless phantom tokens (bbx_ph_...) swapped at boobox-proxy."
+                    subtitle: "Keep real API keys in the Seatbelt-denied Host Vault (~/boo_box/vault/) or 1Password while sandboxes only ever see worthless phantom tokens (bbx_ph_...) swapped at boobox-proxy."
                 )
 
                 // 1. Egress Proxy & Firewall
@@ -536,7 +536,7 @@ private struct SecretsNetworkSettingsTab: View {
                 // 2. Host Secret Vault
                 SettingsCard(title: "Host Secret Vault (Phantom-Token Injection)") {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("Real secrets stay in macOS Keychain or 1Password (`op://`) and are NEVER written to `config.json` or sandbox files. Sending a phantom token to any host outside its allowed list is hard-blocked (`403`).")
+                        Text("Real secrets stay in the host-only Vault (`~/boo_box/vault/`, `0700`, Seatbelt-denied) or 1Password (`op://`) and are NEVER written to `config.json` or sandbox files. Sending a phantom token to any host outside its allowed list is hard-blocked (`403`).")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -572,7 +572,7 @@ private struct SecretsNetworkSettingsTab: View {
                             }
 
                             if state.newSource == .keychain {
-                                SecureField("Secret value (saved to macOS Keychain)", text: $state.newSecretValue)
+                                SecureField("Secret value (saved to host-only Vault)", text: $state.newSecretValue)
                                     .textFieldStyle(.roundedBorder)
                                     .font(.system(size: 11.5, design: .monospaced))
                             } else {
@@ -629,7 +629,7 @@ private struct SecretsNetworkSettingsTab: View {
                                             HStack(spacing: 6) {
                                                 Text(entry.envVar)
                                                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                                                Text(entry.source == .keychain ? "Keychain" : "1Password")
+                                                Text(entry.source == .keychain ? "Host Vault" : "1Password")
                                                     .font(.system(size: 9.5, weight: .medium))
                                                     .padding(.horizontal, 5)
                                                     .padding(.vertical, 1.5)

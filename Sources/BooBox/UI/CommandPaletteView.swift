@@ -284,7 +284,7 @@ struct CommandPaletteOverlay: View {
         let actions: [(String, String, String, Color, String?, () -> Void)] = [
             ("New Session", "Create a new isolated sandbox tab", "plus.square", Color(red: 0.25, green: 0.84, blue: 0.72), "⌘T", { store.newSession(mode: .sandbox) }),
             ("New Scratch Sandbox", "Create an empty scratch macOS sandbox", "sparkles", Color(red: 0.25, green: 0.84, blue: 0.72), nil, { store.newScratchSession() }),
-            ("Open Folder in Sandbox…", "Zero-copy APFS clone a project folder", "folder.badge.plus", Color(red: 0.25, green: 0.84, blue: 0.72), "⇧⌘O", { store.openProjectFolderPicker() }),
+            ("Open Folder in Sandbox…", "Mount or clone a project folder into an isolated sandbox", "folder.badge.plus", Color(red: 0.25, green: 0.84, blue: 0.72), "⇧⌘O", { store.openProjectFolderPicker() }),
             ("New Private Linux VM", "Boot an isolated arm64 Linux microVM", "cpu", Color(red: 0.38, green: 0.72, blue: 1.0), "⇧⌘N", { store.newSession(mode: .linuxVM) }),
             ("New Unsandboxed Host Shell", "Open raw macOS shell with host access", "exclamationmark.triangle", Color(red: 1.0, green: 0.42, blue: 0.38), "⌥⌘T", { store.newSession(mode: .rawHost) }),
             ("Configure Active Sandbox…", "Per-sandbox network, secrets, env & resource limits", "slider.horizontal.3", .accentColor, "⌥⌘,", { store.openActiveSandboxConfig() }),
@@ -294,7 +294,7 @@ struct CommandPaletteOverlay: View {
             ("Toggle Sidebar", "Show or hide the session sidebar", "sidebar.left", .secondary, "⌘B", { store.toggleSidebarVisibility() }),
             ("Flip Sidebar Side", "Move sidebar between left and right", "arrow.left.arrow.right", .secondary, nil, { store.toggleSidebarPosition() }),
             ("Settings…", "Open boo_box Settings", "gearshape", .secondary, "⌘,", { store.openSettings() }),
-            ("Connections (Apps & MCPs)…", "1-click setup for GitHub, cloud CLIs, MCP servers & LLM keys", "link.circle.fill", Color(red: 0.25, green: 0.84, blue: 0.72), nil, {
+            ("Connections (Auth & MCPs)…", "GitHub sandbox shell auth & 1-click OAuth Agent MCP servers", "link.circle.fill", Color(red: 0.25, green: 0.84, blue: 0.72), nil, {
                 SettingsNavState.shared.selectedTab = .connections
                 store.openSettings()
             }),

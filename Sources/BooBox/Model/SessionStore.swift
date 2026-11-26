@@ -421,10 +421,11 @@ final class SessionStore: ObservableObject {
     @Published var renamingSavedSessionID: UUID?
     @Published var searchQuery: String = ""
     @Published var searchFocusRequestID: Int = 0
-    @Published var activeProjectTemplateURL: URL?
-    @Published var activeProjectDisplayName: String?
-    @Published var activeProjectExcludeEnvOverride: Bool?
     @Published var cloningProjectName: String?
+    @Published var pinnedFolderPaths: [String] = []
+    private let pinnedFoldersURL: URL = {
+        BooBoxPaths.rootDirURL.appendingPathComponent("pinned-folders.json")
+    }()
     @Published var configuringTarget: SandboxConfigTarget?
     @Published var isCommandPaletteOpen: Bool = false
     @Published var isTerminalSearchOpen: Bool = false
@@ -440,8 +441,7 @@ final class SessionStore: ObservableObject {
     private var lastProxyEventSeq: UInt64 = 0
     private var dismissedProxyAlertKeys: Set<String> = []
     private let persistedStateURL: URL = {
-        let realHome = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath()
-        return realHome.appendingPathComponent("boo_box/run/last-open-sessions.json")
+        BooBoxPaths.rootDirURL.appendingPathComponent("run/last-open-sessions.json")
     }()
     var filteredSessions: [TerminalSession] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -487,6 +487,7 @@ final class SessionStore: ObservableObject {
         self.themeBackground = GhosttyRuntime.shared.themeColors.background
         self.stageView.backgroundColor = self.themeBackground
         wireRuntimeCallbacks()
+        self.pinnedFolderPaths = loadPinnedFolderPaths()
         NotificationManager.shared.onSelectSession = { [weak self] sessionID in
             self?.selectSession(sessionID)
         }
@@ -530,41 +531,6 @@ final class SessionStore: ObservableObject {
             return session
 
         case .sandbox:
-            if let templateURL = activeProjectTemplateURL {
-                let projectName = activeProjectDisplayName ?? templateURL.lastPathComponent
-                let cfg = BooBoxConfigManager.shared.config.general
-                let excludeEnv = activeProjectExcludeEnvOverride ?? cfg.excludeEnvFilesWhenCloning
-                let existingNames = Set(sessions.map(\.displayTitle) + savedMacSessions.map { $0.sandbox.name })
-                let initialName: String = cfg.autoNameSessions
-                    ? MacOSSandboxManager.shared.semanticProjectName(projectName: projectName, sourceDir: templateURL, avoiding: existingNames)
-                    : MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
-                // Fast path (<5ms): pop pre-warmed APFS clone via atomic rename!
-                if let warmSandbox = MacOSSandboxManager.shared.popWarmProjectSession(
-                    for: templateURL,
-                    id: sessionID,
-                    name: initialName,
-                    excludeEnvFiles: excludeEnv,
-                    skipHeavyDirs: cfg.skipHeavyDirsWhenCloning
-                ) {
-                    return startSessionWithMacSandbox(warmSandbox, sequenceNumber: seq)
-                }
-
-                // Fallback if warm spare is still building in background
-                let sourceURL: URL
-                if FileManager.default.fileExists(atPath: templateURL.path) {
-                    sourceURL = templateURL
-                } else if let fallback = sessions.last(where: { $0.macSandbox?.sourceProjectPath != nil })?.macSandbox?.workspaceDir {
-                    sourceURL = fallback
-                } else {
-                    return createScratchMacSandboxSession(sequenceNumber: seq)
-                }
-                spawnClonedProjectSession(
-                    from: sourceURL,
-                    displayName: projectName,
-                    excludeEnvOverride: activeProjectExcludeEnvOverride
-                )
-                return nil
-            }
             return createScratchMacSandboxSession(sequenceNumber: seq)
         case .linuxVM:
             // Isolated Apple Silicon arm64 Linux 6.18 microVM. Never falls back to host shell.
@@ -623,7 +589,10 @@ final class SessionStore: ObservableObject {
     func openProjectFolderPicker() {
         let panel = NSOpenPanel()
         panel.title = "Open Folder in Isolated Sandbox"
-        panel.message = "Creates a zero-copy APFS clone of this folder inside ~/boo_box/sessions/. New sessions (⌘T) will spawn fresh isolated copies of this folder."
+        let isOverlay = BooBoxConfigManager.shared.config.general.workspaceMode == .overlay
+        panel.message = isOverlay
+            ? "Mounts this folder in ~20 ms via an isolated Copy-on-Write overlay. Edits stay inside ~/boo_box/sessions/ — your source folder is never modified."
+            : "Creates an isolated APFS clone of this folder inside ~/boo_box/sessions/. New sessions (⌘T) will spawn fresh isolated copies of this folder."
         panel.prompt = "Open in Sandbox"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -633,26 +602,100 @@ final class SessionStore: ObservableObject {
         openProjectFolder(url)
     }
 
-    func openProjectFolder(_ url: URL, displayName: String? = nil, excludeEnvOverride: Bool? = nil) {
+    func openProjectFolder(
+        _ url: URL,
+        displayName: String? = nil,
+        excludeEnvOverride: Bool? = nil,
+        forceOverlay: Bool = false
+    ) {
         do {
             let validated = try MacOSSandboxManager.shared.validateProjectDirectory(url)
             let cleanName = (displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? displayName!.trimmingCharacters(in: .whitespacesAndNewlines)
                 : validated.lastPathComponent
-            activeProjectTemplateURL = validated
-            activeProjectDisplayName = cleanName
-            activeProjectExcludeEnvOverride = excludeEnvOverride
-            spawnClonedProjectSession(from: validated, displayName: cleanName, excludeEnvOverride: excludeEnvOverride)
+            spawnClonedProjectSession(
+                from: validated,
+                displayName: cleanName,
+                excludeEnvOverride: excludeEnvOverride,
+                forceOverlay: forceOverlay
+            )
         } catch {
             presentProjectError(error)
         }
     }
-
     func cancelActiveProjectClone() {
         cloningProjectName = nil
         MacOSSandboxManager.shared.cancelActiveClone()
     }
 
+
+    // MARK: - Explicit Opt-In Pinned Folders (Never Auto-Pinned)
+
+    func isFolderPinned(_ path: String) -> Bool {
+        let resolved = URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath().path
+        return pinnedFolderPaths.contains(resolved)
+    }
+
+    func togglePinFolder(_ path: String) {
+        let resolved = URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath().path
+        if let idx = pinnedFolderPaths.firstIndex(of: resolved) {
+            pinnedFolderPaths.remove(at: idx)
+            savePinnedFolderPaths()
+            return
+        }
+        do {
+            let validated = try MacOSSandboxManager.shared.validateProjectDirectory(URL(fileURLWithPath: resolved, isDirectory: true))
+            if !pinnedFolderPaths.contains(validated.path) {
+                pinnedFolderPaths.append(validated.path)
+                savePinnedFolderPaths()
+            }
+        } catch {
+            presentProjectError(error)
+        }
+    }
+
+    func unpinFolder(_ path: String) {
+        let resolved = URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath().path
+        pinnedFolderPaths.removeAll { $0 == path || $0 == resolved }
+        savePinnedFolderPaths()
+    }
+
+    func pinFolderPicker() {
+        let panel = NSOpenPanel()
+        panel.title = "Pin Folder to Sidebar"
+        panel.message = "Pinned folders appear in the sidebar for 1-click isolated sandbox launches. Folders are never pinned automatically."
+        panel.prompt = "Pin Folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let validated = try MacOSSandboxManager.shared.validateProjectDirectory(url)
+            if !pinnedFolderPaths.contains(validated.path) {
+                pinnedFolderPaths.append(validated.path)
+                savePinnedFolderPaths()
+            }
+        } catch {
+            presentProjectError(error)
+        }
+    }
+
+    private func loadPinnedFolderPaths() -> [String] {
+        guard let data = try? Data(contentsOf: pinnedFoldersURL),
+              let paths = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        let fm = FileManager.default
+        return paths.filter { fm.fileExists(atPath: $0) }
+    }
+
+    private func savePinnedFolderPaths() {
+        try? FileManager.default.createDirectory(at: pinnedFoldersURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(pinnedFolderPaths) {
+            try? data.write(to: pinnedFoldersURL, options: .atomic)
+        }
+    }
 
     /// Immediately adopts a session already APFS-cloned by `boo` CLI (0ms extra wait!)
     /// and stages a clean background template snapshot so future `⌘T` presses clone fresh copies.
@@ -679,9 +722,6 @@ final class SessionStore: ObservableObject {
         } else {
             initialName = MacOSSandboxManager.shared.disambiguatedName(base: projectName, avoiding: existingNames)
         }
-        activeProjectTemplateURL = templateDirURL
-        activeProjectDisplayName = projectName
-        activeProjectExcludeEnvOverride = excludeEnvOverride
 
         do {
             let sandbox = try MacOSSandboxManager.shared.adoptPreclonedSession(
@@ -702,12 +742,6 @@ final class SessionStore: ObservableObject {
         } catch {
             presentProjectError(error)
         }
-    }
-    func clearProjectTemplate() {
-        activeProjectTemplateURL = nil
-        activeProjectDisplayName = nil
-        activeProjectExcludeEnvOverride = nil
-        MacOSSandboxManager.shared.cleanupWarmClones()
     }
     private func createScratchMacSandboxSession(sequenceNumber seq: Int) -> TerminalSession? {
         let sessionID = UUID()
@@ -730,7 +764,12 @@ final class SessionStore: ObservableObject {
         return startSessionWithMacSandbox(sandbox, sequenceNumber: seq)
     }
 
-    private func spawnClonedProjectSession(from projectURL: URL, displayName: String, excludeEnvOverride: Bool?) {
+    private func spawnClonedProjectSession(
+        from projectURL: URL,
+        displayName: String,
+        excludeEnvOverride: Bool?,
+        forceOverlay: Bool = false
+    ) {
         let sessionID = UUID()
         let seq = nextAvailableSequenceNumber(for: .sandbox)
         let projectName = displayName
@@ -754,7 +793,8 @@ final class SessionStore: ObservableObject {
                     name: initialName,
                     hasUserCustomName: false,
                     sourceProjectURL: projectURL,
-                    excludeEnvFilesOverride: excludeEnvOverride
+                    excludeEnvFilesOverride: excludeEnvOverride,
+                    workspaceModeOverride: forceOverlay ? .overlay : nil
                 )
             }
             DispatchQueue.main.async { [weak self] in
@@ -763,10 +803,10 @@ final class SessionStore: ObservableObject {
                 switch result {
                 case .success(let sandbox):
                     _ = self.startSessionWithMacSandbox(sandbox, sequenceNumber: seq)
-                    if !sandbox.isOverlay, let templateURL = self.activeProjectTemplateURL {
+                    if !sandbox.isOverlay {
                         let cfg = BooBoxConfigManager.shared.config.general
                         MacOSSandboxManager.shared.replenishWarmCloneInBackground(
-                            for: templateURL,
+                            for: projectURL,
                             excludeEnvFiles: excludeEnvOverride ?? cfg.excludeEnvFilesWhenCloning,
                             skipHeavyDirs: cfg.skipHeavyDirsWhenCloning
                         )
@@ -905,14 +945,16 @@ final class SessionStore: ObservableObject {
         renamingSessionID = id
     }
 
-    private func confirmPermanentSessionDeletion(name: String, shortID: String) -> Bool {
+    private func confirmPermanentSessionDeletion(name: String, shortID: String, isOverlay: Bool) -> Bool {
         guard BooBoxConfigManager.shared.config.general.confirmBeforeDeletingSession else {
             return true
         }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Delete entire session \"\(name)\"?"
-        alert.informativeText = "This permanently deletes the entire session directory (~/boo_box/sessions/\(shortID)/), including all files in workspace/ and its isolated home config. This cannot be undone."
+        alert.informativeText = isOverlay
+            ? "This unmounts and permanently deletes only this sandbox's isolated edits (~/boo_box/sessions/\(shortID)/.overlay/) and home config. Your source folder is never touched."
+            : "This permanently deletes the entire session directory (~/boo_box/sessions/\(shortID)/), including all files in workspace/ and its isolated home config. This cannot be undone."
         alert.showsSuppressionButton = true
         alert.suppressionButton?.title = "Don't ask again (can be re-enabled in Settings)"
         let deleteBtn = alert.addButton(withTitle: "Delete Entire Session")
@@ -929,7 +971,7 @@ final class SessionStore: ObservableObject {
     }
 
     func deleteSavedMacSession(_ sandbox: MacSandboxSession) {
-        guard confirmPermanentSessionDeletion(name: sandbox.name, shortID: sandbox.shortID) else { return }
+        guard confirmPermanentSessionDeletion(name: sandbox.name, shortID: sandbox.shortID, isOverlay: sandbox.isOverlay) else { return }
         // Instant UI removal + atomic POSIX rename to .trash-* + background deletion (0 ms UI hang)
         savedMacSessions.removeAll { $0.id == sandbox.id }
         MacOSSandboxManager.shared.deleteSessionDir(sandbox)
@@ -1007,7 +1049,7 @@ final class SessionStore: ObservableObject {
             closeSession(id)
             return
         }
-        guard confirmPermanentSessionDeletion(name: session.displayTitle, shortID: sb.shortID) else { return }
+        guard confirmPermanentSessionDeletion(name: session.displayTitle, shortID: sb.shortID, isOverlay: sb.isOverlay) else { return }
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         let removed = sessions.remove(at: idx)
         removed.destroyAllPanes(killDaemonPanes: true)
@@ -1196,6 +1238,16 @@ final class SessionStore: ObservableObject {
 
     func duplicateSession(_ id: UUID) {
         guard let source = sessions.first(where: { $0.id == id }) else { return }
+        if source.mode == .sandbox,
+           let srcPath = source.macSandbox?.sourceProjectPath,
+           FileManager.default.fileExists(atPath: srcPath) {
+            openProjectFolder(
+                URL(fileURLWithPath: srcPath, isDirectory: true),
+                excludeEnvOverride: source.macSandbox?.excludeEnvFiles,
+                forceOverlay: source.macSandbox?.isOverlay == true
+            )
+            return
+        }
         newSession(mode: source.mode, workingDirectory: source.focusedPane?.pwd)
     }
 
@@ -1585,6 +1637,9 @@ final class SessionStore: ObservableObject {
                 let livePane = entry.daemonPaneID.flatMap { liveDaemonPanes[$0] }
                 let readySandbox: MacSandboxSession
                 if livePane != nil {
+                    if sb.isOverlay {
+                        try? MacOSSandboxManager.shared.ensureOverlayMountedIfNeeded(sb)
+                    }
                     readySandbox = sb
                 } else if let refreshed = try? MacOSSandboxManager.shared.prepareForResume(sb) {
                     readySandbox = refreshed

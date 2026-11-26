@@ -77,13 +77,9 @@ struct SidebarView: View {
 
     private var launchControls: some View {
         NewSessionSplitButton(
-            pinnedProjectName: store.activeProjectTemplateURL.map {
-                store.activeProjectDisplayName ?? $0.lastPathComponent
-            },
             onNewSandbox: { store.newSession(mode: .sandbox) },
-            onNewScratch: { store.newScratchSession() },
             onOpenProjectFolder: { store.openProjectFolderPicker() },
-            onClearPinnedProject: { store.clearProjectTemplate() },
+            onPinFolder: { store.pinFolderPicker() },
             onNewPrivateVM: { store.newSession(mode: .linuxVM) },
             onNewHostShell: { store.newSession(mode: .rawHost) }
         )
@@ -207,16 +203,21 @@ struct SidebarView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 28)
                 } else {
+                    if !isSearching && !store.pinnedFolderPaths.isEmpty {
+                        pinnedFoldersSection
+                    }
                     if !visibleSessions.isEmpty {
-                        sectionHeader(title: "OPEN", count: visibleSessions.count, topPadding: 2)
+                        sectionHeader(title: "OPEN", count: visibleSessions.count, topPadding: (!isSearching && !store.pinnedFolderPaths.isEmpty) ? 10 : 2)
                         ForEach(Array(visibleSessions.enumerated()), id: \.element.id) { index, session in
                             let realIndex = store.sessions.firstIndex(where: { $0.id == session.id }) ?? index
+                            let srcPath = session.macSandbox?.sourceProjectPath
                             SessionRowView(
                                 session: session,
                                 index: realIndex,
                                 isSelected: store.selectedSessionID == session.id,
                                 isRenaming: store.renamingSessionID == session.id,
                                 sidebarPosition: store.sidebarPosition,
+                                isFolderPinned: srcPath.map { store.isFolderPinned($0) } ?? false,
                                 onSelect: { store.selectSession(session.id) },
                                 onConfigure: { store.openSandboxConfig(for: session.id) },
                                 onClose: { store.closeSession(session.id) },
@@ -233,12 +234,12 @@ struct SidebarView: View {
                                     store.splitFocusedPane(direction: .down)
                                 },
                                 onDuplicate: { store.duplicateSession(session.id) },
+                                onTogglePinFolder: srcPath.map { path in { store.togglePinFolder(path) } },
                                 onResetVM: { store.resetSessionVM(session.id) },
                                 onRevealFolder: { store.revealSessionInFinder(session.id) },
                                 onToggleSidebarSide: { store.toggleSidebarPosition() }
                             )
                             .onDrag {
-                                dragState.draggedSessionID = session.id
                                 return NSItemProvider(object: session.id.uuidString as NSString)
                             }
                             .onDrop(
@@ -260,6 +261,20 @@ struct SidebarView: View {
             .padding(.vertical, 2)
         }
     }
+    private var pinnedFoldersSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            sectionHeader(title: "PINNED", count: store.pinnedFolderPaths.count, topPadding: 2)
+            ForEach(store.pinnedFolderPaths, id: \.self) { path in
+                PinnedFolderRowView(
+                    path: path,
+                    onOpen: { store.openProjectFolder(URL(fileURLWithPath: path, isDirectory: true)) },
+                    onReveal: { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path, isDirectory: true)]) },
+                    onUnpin: { store.unpinFolder(path) }
+                )
+            }
+        }
+    }
+
 
     private func savedMacSessionsSection(items: [SavedMacSandboxItem], hasOpenSessions: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -351,6 +366,7 @@ private struct SessionRowView: View {
     let isSelected: Bool
     let isRenaming: Bool
     let sidebarPosition: SidebarPosition
+    let isFolderPinned: Bool
 
     let onSelect: () -> Void
     let onConfigure: () -> Void
@@ -362,6 +378,7 @@ private struct SessionRowView: View {
     let onSplitRight: () -> Void
     let onSplitDown: () -> Void
     let onDuplicate: () -> Void
+    let onTogglePinFolder: (() -> Void)?
     let onResetVM: () -> Void
     let onRevealFolder: () -> Void
     let onToggleSidebarSide: () -> Void
@@ -566,6 +583,9 @@ private struct SessionRowView: View {
             Button("Split Right (⌘D)", action: onSplitRight)
             Button("Split Down (⇧⌘D)", action: onSplitDown)
             Button("Duplicate Session", action: onDuplicate)
+            if let onTogglePinFolder {
+                Button(isFolderPinned ? "Unpin Folder from Sidebar" : "Pin Folder to Sidebar", action: onTogglePinFolder)
+            }
             if session.macSandbox != nil {
                 Button("Reveal Session Folder in Finder", action: onRevealFolder)
             }
@@ -615,6 +635,15 @@ private struct SessionRowView: View {
             SessionPopoverActionRow(icon: "plus.square.on.square", title: "Duplicate Session") {
                 local.showingActions = false
                 onDuplicate()
+            }
+            if let onTogglePinFolder {
+                SessionPopoverActionRow(
+                    icon: isFolderPinned ? "pin.slash" : "pin",
+                    title: isFolderPinned ? "Unpin Folder" : "Pin Folder to Sidebar"
+                ) {
+                    local.showingActions = false
+                    onTogglePinFolder()
+                }
             }
             if session.macSandbox != nil {
                 SessionPopoverActionRow(icon: "folder", title: "Reveal in Finder") {
@@ -711,7 +740,13 @@ private struct SavedMacSessionRowView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
-                Text("\(item.sandbox.shortID) · \(item.fileCount) item\(item.fileCount == 1 ? "" : "s")")
+                Text(
+                    item.sandbox.isOverlay
+                        ? (item.fileCount == 0
+                            ? "\(item.sandbox.shortID) · overlay · clean"
+                            : "\(item.sandbox.shortID) · overlay · \(item.fileCount) edit\(item.fileCount == 1 ? "" : "s")")
+                        : "\(item.sandbox.shortID) · \(item.fileCount) item\(item.fileCount == 1 ? "" : "s")"
+                )
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -817,6 +852,78 @@ private struct SavedMacSessionRowView: View {
         }
         .padding(6)
         .frame(width: 214)
+    }
+}
+
+@MainActor
+private final class PinnedRowHoverState: ObservableObject {
+    @Published var isHovered = false
+}
+
+private struct PinnedFolderRowView: View {
+    let path: String
+    let onOpen: () -> Void
+    let onReveal: () -> Void
+    let onUnpin: () -> Void
+    @StateObject private var hover = PinnedRowHoverState()
+
+    private let mintAccent = Color(red: 0.25, green: 0.84, blue: 0.72)
+
+    private var displayName: String {
+        URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "pin.fill")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(mintAccent.opacity(0.85))
+                .frame(width: 14)
+
+            Text(displayName)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Color.primary.opacity(hover.isHovered ? 0.95 : 0.80))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 4)
+
+            if hover.isHovered {
+                Button(action: onUnpin) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18, height: 18)
+                        .background(RoundedRectangle(cornerRadius: 4, style: .continuous).fill(Color.primary.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .help("Unpin \(displayName)")
+            } else {
+                Image(systemName: "plus")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5.5)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(hover.isHovered ? mintAccent.opacity(0.10) : Color.primary.opacity(0.035))
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.11)) {
+                hover.isHovered = hovering
+            }
+        }
+        .onTapGesture { onOpen() }
+        .contextMenu {
+            Button("Open in New Sandbox", action: onOpen)
+            Button("Reveal in Finder", action: onReveal)
+            Divider()
+            Button("Unpin Folder", role: .destructive, action: onUnpin)
+        }
+        .help("Click to open a fresh isolated sandbox of \(path)")
     }
 }
 
