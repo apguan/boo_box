@@ -24,6 +24,16 @@ Running autonomous coding agents directly on your host shell gives them full acc
   - `boobox-clone` uses kernel `clonefile(2)` (`0` extra SSD blocks) + warm pool + Git delta sync + `<1 ms` Unix domain socket IPC (`~/boo_box/run/app.sock`).
   - Deleting saved/active sessions and running `rm -rf <dir>` inside sandboxes (via the read-only `~/.boobox-bin/rm` shim) both use atomic APFS move-aside + detached background reaping (`<5 ms` even for 300k-file `node_modules`; opt out with `BOOBOX_SYNC_RM=1`).
 
+
+## First-Time Setup (Recommended: Let Your Agent Do It)
+
+Because `boo_box` runs every tab inside a strict macOS Seatbelt sandbox (kernel-blocking macOS Keychain, `~/.ssh`, host `/opt/homebrew` writes, and files outside your cloned workspace), there is a bit of one-time setup to wire your GitHub login, API keys, cloud CLIs, global toolchains, and MCP servers so you never have to re-authenticate per tab.
+
+**Fastest way to get set up:** open your coding agent (Claude Code, OMP, Codex, OpenCode, etc.) in a host terminal and paste:
+
+> **Read `SETUP_COOKBOOK.md` in this repo, walk me through the setup questions, and configure `boo_box` for my Mac.**
+
+You can also configure accounts, CLIs, and 1-click MCP servers visually anytime inside **`Settings (⌘,) → Connections`**, or read **[`SETUP_COOKBOOK.md`](./SETUP_COOKBOOK.md)** directly for every recipe and sandbox gotcha.
 ---
 
 ## Architecture
@@ -109,8 +119,14 @@ boo env shell             # Open an interactive sandboxed shell targeting ~/boo_
 boo tools [--json]        # List auto-discovered toolchain directories & binaries
 boo env rm <dir-path>     # Remove a toolchain directory inside ~/boo_box/env
 boo env reset             # Wipe and recreate ~/boo_box/env cleanly
-```
 
+# One-time Keychain Git + GitHub setup for all sandboxes (also in Settings -> Connections)
+boo setup-github                # Interactive wizard (fine-grained PAT or host `gh` login)
+boo setup-github --token <pat>  # Store a repo-scoped fine-grained PAT in macOS Keychain
+boo setup-github --from-gh      # Import current host `gh auth token` into macOS Keychain
+boo setup-github --status       # Inspect current Git + GitHub sandbox setup
+boo setup-github --remove       # Delete GitHub token from macOS Keychain & disable connection
+```
 ---
 
 ## Keyboard Shortcuts
@@ -125,12 +141,13 @@ boo env reset             # Wipe and recreate ~/boo_box/env cleanly
 | `⌘,` | Global `boo_box` Settings |
 | `⌘D` / `⇧⌘D` | Split pane right / down |
 | `⌥⌘[` / `⌥⌘]` | Previous / next split pane |
+| `⌘P` | Quick Switcher & Command Palette (jump across open/past sessions & actions) |
+| `⌘F` / `⌘G` / `⇧⌘G` | In-terminal GPU Find / Next Match / Previous Match |
 | `⌘1`–`⌘9` | Jump to open session |
 | `⌘B` / `⌥⌘S` | Toggle sidebar / flip sidebar Left ↔ Right |
-| `⇧⌘E` / `⇧⌘F` | Rename active session / search sessions |
+| `⇧⌘E` / `⇧⌘F` | Rename active session / search sidebar sessions |
 | `⇧⌘K` | Reset Private VM to clean state |
 | `⌘W` / `⇧⌘W` | Close pane / close session tab (keeps non-empty macOS sandboxes in `PAST`) |
-
 ---
 
 ## Security Model
