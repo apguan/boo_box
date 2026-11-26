@@ -28,7 +28,6 @@ private final class CommandPaletteState: ObservableObject {
 struct CommandPaletteOverlay: View {
     @ObservedObject var store: SessionStore
     @StateObject private var local = CommandPaletteState()
-    @FocusState private var searchFocused: Bool
 
     private var filteredItems: [CommandPaletteItem] {
         let all = buildAllItems()
@@ -54,13 +53,25 @@ struct CommandPaletteOverlay: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.secondary)
 
-                    TextField("Jump to session or run a command…", text: $local.query)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14))
-                        .focused($searchFocused)
-                        .onSubmit {
+                    CommandPaletteSearchField(
+                        text: $local.query,
+                        placeholder: "Jump to session or run a command…",
+                        onMoveUp: {
+                            let count = filteredItems.count
+                            if count > 0 { local.selectedIndex = (local.selectedIndex - 1 + count) % count }
+                        },
+                        onMoveDown: {
+                            let count = filteredItems.count
+                            if count > 0 { local.selectedIndex = (local.selectedIndex + 1) % count }
+                        },
+                        onSubmit: {
                             executeSelected()
+                        },
+                        onCancel: {
+                            store.closeCommandPalette()
                         }
+                    )
+                    .frame(height: 22)
 
                     if !local.query.isEmpty {
                         Button {
@@ -151,24 +162,9 @@ struct CommandPaletteOverlay: View {
         }
         .onAppear {
             local.selectedIndex = 0
-            searchFocused = true
         }
         .onChange(of: local.query) { _, _ in
             local.selectedIndex = 0
-        }
-        .onKeyPress(.upArrow) {
-            let count = filteredItems.count
-            if count > 0 { local.selectedIndex = (local.selectedIndex - 1 + count) % count }
-            return .handled
-        }
-        .onKeyPress(.downArrow) {
-            let count = filteredItems.count
-            if count > 0 { local.selectedIndex = (local.selectedIndex + 1) % count }
-            return .handled
-        }
-        .onKeyPress(.escape) {
-            store.closeCommandPalette()
-            return .handled
         }
     }
 
@@ -332,5 +328,96 @@ struct CommandPaletteOverlay: View {
         }
 
         return items
+    }
+}
+
+/// Native AppKit search field that claims `window.makeFirstResponder` immediately on mount
+/// (preventing the sidebar search field or Metal terminal view from stealing focus) and
+/// intercepts ↑ / ↓ / ↵ / Esc directly inside the field editor.
+private struct CommandPaletteSearchField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
+    let onSubmit: () -> Void
+    let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> AutoFocusTextField {
+        let field = AutoFocusTextField()
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = NSFont.systemFont(ofSize: 14)
+        field.placeholderString = placeholder
+        field.usesSingleLineMode = true
+        field.lineBreakMode = .byTruncatingTail
+        field.delegate = context.coordinator
+        field.stringValue = text
+        return field
+    }
+
+    func updateNSView(_ nsView: AutoFocusTextField, context: Context) {
+        context.coordinator.parent = self
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+    }
+
+    final class AutoFocusTextField: NSTextField {
+        private var didClaimInitialFocus = false
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            claimFocusIfNeeded()
+        }
+
+        private func claimFocusIfNeeded() {
+            guard !didClaimInitialFocus, let win = window else { return }
+            didClaimInitialFocus = true
+            DispatchQueue.main.async { [weak self, weak win] in
+                guard let self, let win else { return }
+                win.makeFirstResponder(self)
+                if let editor = self.currentEditor() {
+                    editor.selectedRange = NSRange(location: self.stringValue.utf16.count, length: 0)
+                }
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: CommandPaletteSearchField
+
+        init(parent: CommandPaletteSearchField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            switch commandSelector {
+            case #selector(NSResponder.moveUp(_:)):
+                parent.onMoveUp()
+                return true
+            case #selector(NSResponder.moveDown(_:)):
+                parent.onMoveDown()
+                return true
+            case #selector(NSResponder.insertNewline(_:)):
+                parent.onSubmit()
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                parent.onCancel()
+                return true
+            default:
+                return false
+            }
+        }
     }
 }
