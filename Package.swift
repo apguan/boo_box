@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "boobox-clone", targets: ["BooBoxClone"]),
         .executable(name: "boobox-proxy", targets: ["BooBoxProxy"]),
         .executable(name: "booboxd", targets: ["BooBoxDaemon"]),
+        .executable(name: "boobox-overlay", targets: ["BooBoxOverlay"]),
     ],
     dependencies: [
         .package(url: "https://github.com/loeschg/GhosttyKit", exact: "1.4.0"),
@@ -49,6 +50,13 @@ let package = Package(
         .executableTarget(
             name: "BooBoxDaemon",
             path: "Sources/BooBoxDaemon"
+        ),
+        .executableTarget(
+            name: "BooBoxOverlay",
+            path: "Sources/BooBoxOverlay",
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
         ),
     ]
 )

@@ -8,13 +8,13 @@ APP_BUNDLE="$ROOT/build/${APP_NAME}.app"
 BIN_DIR="$ROOT/.build/${CONFIG}"
 
 cd "$ROOT"
-echo "Building ${APP_NAME} + boobox-attach + boobox-clone + boobox-proxy + booboxd (${CONFIG})..."
+echo "Building ${APP_NAME} + boobox-attach + boobox-clone + boobox-proxy + booboxd + boobox-overlay (${CONFIG})..."
 swift build -c "$CONFIG" --product boo_box
 swift build -c "$CONFIG" --product boobox-attach
 swift build -c release --product boobox-clone
 swift build -c "$CONFIG" --product boobox-proxy
 swift build -c "$CONFIG" --product booboxd
-
+swift build -c release --product boobox-overlay
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/vm"
 
@@ -23,7 +23,8 @@ cp "$BIN_DIR/boobox-attach" "$APP_BUNDLE/Contents/MacOS/boobox-attach"
 cp "$ROOT/.build/release/boobox-clone" "$APP_BUNDLE/Contents/MacOS/boobox-clone"
 cp "$BIN_DIR/boobox-proxy" "$APP_BUNDLE/Contents/MacOS/boobox-proxy"
 cp "$BIN_DIR/booboxd" "$APP_BUNDLE/Contents/MacOS/booboxd"
-chmod +x "$APP_BUNDLE/Contents/MacOS/boo_box" "$APP_BUNDLE/Contents/MacOS/boobox-attach" "$APP_BUNDLE/Contents/MacOS/boobox-clone" "$APP_BUNDLE/Contents/MacOS/boobox-proxy" "$APP_BUNDLE/Contents/MacOS/booboxd"
+cp "$ROOT/.build/release/boobox-overlay" "$APP_BUNDLE/Contents/MacOS/boobox-overlay"
+chmod +x "$APP_BUNDLE/Contents/MacOS/boo_box" "$APP_BUNDLE/Contents/MacOS/boobox-attach" "$APP_BUNDLE/Contents/MacOS/boobox-clone" "$APP_BUNDLE/Contents/MacOS/boobox-proxy" "$APP_BUNDLE/Contents/MacOS/booboxd" "$APP_BUNDLE/Contents/MacOS/boobox-overlay"
 if [ -f "$ROOT/Resources/boo_box.icns" ]; then
     cp "$ROOT/Resources/boo_box.icns" "$APP_BUNDLE/Contents/Resources/boo_box.icns"
 fi
@@ -130,8 +131,8 @@ codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-attach"
 codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-clone"
 codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-proxy"
 codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/booboxd"
+codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/boobox-overlay"
 codesign --force --sign - --entitlements "$ROOT/Resources/boo_box.entitlements" "$APP_BUNDLE"
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_BUNDLE" 2>/dev/null || true
 
 # Record built app path for portable `boo` CLI lookup & install/update `~/.local/bin/boo`
 mkdir -p "$HOME/boo_box"
