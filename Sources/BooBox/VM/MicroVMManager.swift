@@ -42,6 +42,17 @@ enum VMState: Equatable, Sendable {
     case failed(String)
 }
 
+struct VMForwardedPort: Identifiable, Equatable, Sendable {
+    var id: UInt16 { guestPort }
+    let guestPort: UInt16
+    let hostPort: UInt16
+    let fromDockerfile: Bool
+
+    var localURLString: String {
+        "http://127.0.0.1:\(hostPort)"
+    }
+}
+
 /// Manages one live Apple Silicon arm64 Linux microVM backed by Virtualization.framework.
 /// Accepts multiple concurrent PTY attachments over a local Unix socket (`socketPath`)
 /// and multiplexes each attachment onto a dedicated guest vsock connection (port 5123).
@@ -69,11 +80,148 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
     private(set) var currentState: VMState = .booting
     var onStateChange: (@MainActor @Sendable (VMState) -> Void)?
     var onBootReady: (@MainActor @Sendable (Double) -> Void)?
+    var onForwardedPortsChange: (@MainActor @Sendable ([VMForwardedPort]) -> Void)?
+
+    private final class ForwardedListener: @unchecked Sendable {
+        let guestPort: UInt16
+        let hostPort: UInt16
+        let fromDockerfile: Bool
+        private let lock = NSLock()
+        private var listenFD: Int32
+        private var wakeReadFD: Int32
+        private var wakeWriteFD: Int32
+        private var stopped = false
+
+        init?(guestPort: UInt16, fromDockerfile: Bool, onAccept: @escaping @Sendable (Int32, UInt16) -> Void) {
+            let lfd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            guard lfd >= 0 else { return nil }
+            var one: Int32 = 1
+            _ = setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+
+            var sa = sockaddr_in()
+            sa.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            sa.sin_family = sa_family_t(AF_INET)
+            sa.sin_port = 0 // OS picks a guaranteed-free ephemeral host loopback port
+            sa.sin_addr = in_addr(s_addr: UInt32(INADDR_LOOPBACK).bigEndian)
+            let bound = withUnsafePointer(to: &sa) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(lfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+            guard bound, Darwin.listen(lfd, 64) == 0 else {
+                Darwin.close(lfd)
+                return nil
+            }
+
+            var boundAddr = sockaddr_in()
+            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let gotName = withUnsafeMutablePointer(to: &boundAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    getsockname(lfd, $0, &len) == 0
+                }
+            }
+            let assignedPort = UInt16(bigEndian: boundAddr.sin_port)
+            guard gotName, assignedPort > 0 else {
+                Darwin.close(lfd)
+                return nil
+            }
+
+            var pfds: [Int32] = [-1, -1]
+            guard pipe(&pfds) == 0 else {
+                Darwin.close(lfd)
+                return nil
+            }
+            _ = fcntl(pfds[0], F_SETFL, O_NONBLOCK)
+            _ = fcntl(pfds[1], F_SETFL, O_NONBLOCK)
+
+            self.guestPort = guestPort
+            self.hostPort = assignedPort
+            self.fromDockerfile = fromDockerfile
+            self.listenFD = lfd
+            self.wakeReadFD = pfds[0]
+            self.wakeWriteFD = pfds[1]
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.acceptLoop(onAccept: onAccept)
+            }
+        }
+
+        private func acceptLoop(onAccept: @escaping @Sendable (Int32, UInt16) -> Void) {
+            defer {
+                lock.lock()
+                let lfd = listenFD; listenFD = -1
+                let rfd = wakeReadFD; wakeReadFD = -1
+                let wfd = wakeWriteFD; wakeWriteFD = -1
+                lock.unlock()
+                if lfd >= 0 { Darwin.close(lfd) }
+                if rfd >= 0 { Darwin.close(rfd) }
+                if wfd >= 0 { Darwin.close(wfd) }
+            }
+            while true {
+                lock.lock()
+                let lfd = listenFD
+                let rfd = wakeReadFD
+                let isStopped = stopped
+                lock.unlock()
+                guard !isStopped, lfd >= 0, rfd >= 0 else { break }
+
+                var pfds: [pollfd] = [
+                    pollfd(fd: lfd, events: Int16(POLLIN), revents: 0),
+                    pollfd(fd: rfd, events: Int16(POLLIN), revents: 0),
+                ]
+                let rc = poll(&pfds, 2, 500)
+                if rc < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                if rc == 0 { continue }
+                if (pfds[1].revents & Int16(POLLIN | POLLHUP | POLLNVAL)) != 0 { break }
+                if (pfds[0].revents & Int16(POLLIN)) != 0 {
+                    let cfd = Darwin.accept(lfd, nil, nil)
+                    if cfd >= 0 {
+                        onAccept(cfd, guestPort)
+                    }
+                } else if (pfds[0].revents & Int16(POLLHUP | POLLERR | POLLNVAL)) != 0 {
+                    break
+                }
+            }
+        }
+
+        func stop() {
+            lock.lock()
+            if stopped {
+                lock.unlock()
+                return
+            }
+            stopped = true
+            let wfd = wakeWriteFD
+            lock.unlock()
+            if wfd >= 0 {
+                var b: UInt8 = 1
+                _ = Darwin.write(wfd, &b, 1)
+            }
+        }
+    }
+
+    private let forwardLock = NSLock()
+    private var dockerfileExposedPorts: Set<UInt16> = []
+    private var activeForwards: [UInt16: ForwardedListener] = [:]
+    private var lastPublishedPorts: [VMForwardedPort] = []
+    private var portScanTimer: DispatchSourceTimer?
+    private var portScanInFlight = false
+
+    var currentForwardedPorts: [VMForwardedPort] {
+        forwardLock.lock()
+        defer { forwardLock.unlock() }
+        return activeForwards.values
+            .map { VMForwardedPort(guestPort: $0.guestPort, hostPort: $0.hostPort, fromDockerfile: $0.fromDockerfile) }
+            .sorted { $0.guestPort < $1.guestPort }
+    }
 
     private var consoleLog = ""
     private let logLock = NSLock()
     private static let guestPTYPort: UInt32 = 5123
-
+    private static let guestFwdPort: UInt32 = 5124
     init(id: UUID, assets: GuestAssets, overrides: SandboxOverrideConfig = .default) throws {
         self.id = id
         self.overrides = overrides
@@ -159,6 +307,7 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
             resolvedDockerfile = parsed
         }
         self.parsedDockerfile = resolvedDockerfile
+        self.dockerfileExposedPorts = Self.parseExposedTCPPorts(from: resolvedDockerfile?.exposedPorts ?? [])
 
         // VirtioFS shares: optional host folder (/mnt/host) + optional temporary read-only Dockerfile COPY context (/mnt/context)
         var fsDevices: [VZDirectorySharingDeviceConfiguration] = []
@@ -258,6 +407,7 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
                         cb?(bootMs)
                     }
                     self.runConfiguredProvisioningIfNeeded()
+                    self.startPortForwardingSubsystem()
                 }
             }
         }
@@ -532,6 +682,210 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
         }
     }
 
+    // MARK: - Automatic Per-VM vsock:5124 TCP Port Forwarding
+
+    private static func parseExposedTCPPorts(from specs: [String]) -> Set<UInt16> {
+        var result: Set<UInt16> = []
+        for raw in specs {
+            let lower = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if lower.hasSuffix("/udp") { continue }
+            let numPart = lower.split(separator: "/").first.map(String.init) ?? lower
+            if let p = UInt16(numPart), p > 0 {
+                result.insert(p)
+            }
+        }
+        return result
+    }
+
+    private func startPortForwardingSubsystem() {
+        // 1. Immediately bind host loopback listeners for any Dockerfile EXPOSE ports
+        reconcileForwardedPorts(liveGuestPorts: [])
+
+        // 2. Poll guest /proc/net/tcp[6] via vsock:5124 every 1.5s to auto-discover live servers
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 0.6, repeating: 1.5)
+        timer.setEventHandler { [weak self] in
+            self?.pollGuestListeningPortsOnce()
+        }
+        forwardLock.lock()
+        portScanTimer?.cancel()
+        portScanTimer = timer
+        forwardLock.unlock()
+        timer.resume()
+    }
+
+    private func pollGuestListeningPortsOnce() {
+        guard !isStopped, isReady else { return }
+        forwardLock.lock()
+        if portScanInFlight {
+            forwardLock.unlock()
+            return
+        }
+        portScanInFlight = true
+        forwardLock.unlock()
+
+        vmQueue.async { [weak self] in
+            guard let self, !self.isStopped, let sockDev = self.socketDevice else {
+                self?.clearPortScanInFlight()
+                return
+            }
+            sockDev.connect(toPort: Self.guestFwdPort) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .failure:
+                    self.clearPortScanInFlight()
+                case .success(let conn):
+                    let fd = conn.fileDescriptor
+                    nonisolated(unsafe) let retainedConn = conn
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        defer {
+                            withExtendedLifetime(retainedConn) { retainedConn.close() }
+                            self?.clearPortScanInFlight()
+                        }
+                        Self.sendRawBytes(fd: fd, data: Data("LIST\n".utf8))
+                        var data = Data()
+                        var buf = [UInt8](repeating: 0, count: 1024)
+                        while data.count < 4096 {
+                            let n = Darwin.read(fd, &buf, buf.count)
+                            if n < 0 {
+                                if errno == EINTR { continue }
+                                break
+                            }
+                            if n == 0 { break }
+                            data.append(buf, count: n)
+                            if buf[0..<n].contains(0x0A) { break }
+                        }
+                        guard let line = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                              line.hasPrefix("PORTS") else {
+                            return
+                        }
+                        let tokens = line.split(whereSeparator: { $0.isWhitespace }).dropFirst()
+                        let livePorts = Set(tokens.compactMap { UInt16($0) }.filter { $0 > 0 })
+                        self?.reconcileForwardedPorts(liveGuestPorts: livePorts)
+                    }
+                }
+            }
+        }
+    }
+
+    private func clearPortScanInFlight() {
+        forwardLock.lock()
+        portScanInFlight = false
+        forwardLock.unlock()
+    }
+
+    private func reconcileForwardedPorts(liveGuestPorts: Set<UInt16>) {
+        guard !isStopped else { return }
+        let desired = dockerfileExposedPorts.union(liveGuestPorts)
+        var removed: [ForwardedListener] = []
+        var snapshotToPublish: [VMForwardedPort]? = nil
+
+        forwardLock.lock()
+        for (gp, listener) in activeForwards where !desired.contains(gp) {
+            activeForwards.removeValue(forKey: gp)
+            removed.append(listener)
+        }
+        for gp in desired.sorted() where activeForwards[gp] == nil {
+            let fromDF = dockerfileExposedPorts.contains(gp)
+            if let listener = ForwardedListener(guestPort: gp, fromDockerfile: fromDF, onAccept: { [weak self] clientFD, guestPort in
+                self?.forwardHostTCPClient(clientFD: clientFD, guestPort: guestPort)
+            }) {
+                activeForwards[gp] = listener
+            }
+        }
+        let current = activeForwards.values
+            .map { VMForwardedPort(guestPort: $0.guestPort, hostPort: $0.hostPort, fromDockerfile: $0.fromDockerfile) }
+            .sorted { $0.guestPort < $1.guestPort }
+        if current != lastPublishedPorts {
+            lastPublishedPorts = current
+            snapshotToPublish = current
+        }
+        forwardLock.unlock()
+
+        for l in removed { l.stop() }
+
+        if let publish = snapshotToPublish {
+            let cb = onForwardedPortsChange
+            Task { @MainActor in
+                cb?(publish)
+            }
+        }
+    }
+
+    private func forwardHostTCPClient(clientFD: Int32, guestPort: UInt16) {
+        vmQueue.async { [weak self] in
+            guard let self, !self.isStopped, let sockDev = self.socketDevice else {
+                Darwin.close(clientFD)
+                return
+            }
+            sockDev.connect(toPort: Self.guestFwdPort) { [weak self] result in
+                guard self != nil else {
+                    Darwin.close(clientFD)
+                    return
+                }
+                switch result {
+                case .failure:
+                    Darwin.close(clientFD)
+                case .success(let conn):
+                    let vsockFD = conn.fileDescriptor
+                    nonisolated(unsafe) let retainedConn = conn
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        Self.sendRawBytes(fd: vsockFD, data: Data("TCP \(guestPort)\n".utf8))
+                        // Read guest handshake reply ("OK\n" or "ERR\n")
+                        var lineBytes: [UInt8] = []
+                        var ch: UInt8 = 0
+                        while lineBytes.count < 32 {
+                            let n = Darwin.read(vsockFD, &ch, 1)
+                            if n < 0 {
+                                if errno == EINTR { continue }
+                                break
+                            }
+                            if n == 0 { break }
+                            if ch == 0x0A { break }
+                            lineBytes.append(ch)
+                        }
+                        guard String(decoding: lineBytes, as: UTF8.self) == "OK" else {
+                            Darwin.close(clientFD)
+                            withExtendedLifetime(retainedConn) { retainedConn.close() }
+                            return
+                        }
+
+                        let group = DispatchGroup()
+                        group.enter()
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            defer { group.leave() }
+                            Self.pump(from: clientFD, to: vsockFD)
+                            _ = Darwin.shutdown(vsockFD, SHUT_WR)
+                        }
+                        group.enter()
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            defer { group.leave() }
+                            Self.pump(from: vsockFD, to: clientFD)
+                            _ = Darwin.shutdown(clientFD, SHUT_WR)
+                        }
+                        group.notify(queue: DispatchQueue.global(qos: .utility)) {
+                            Darwin.close(clientFD)
+                            withExtendedLifetime(retainedConn) { retainedConn.close() }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopAllPortForwards() {
+        forwardLock.lock()
+        let timer = portScanTimer
+        portScanTimer = nil
+        let listeners = Array(activeForwards.values)
+        activeForwards.removeAll()
+        lastPublishedPorts = []
+        forwardLock.unlock()
+
+        timer?.cancel()
+        for l in listeners { l.stop() }
+    }
+
     // MARK: - Lifecycle / Teardown
 
     func stop() {
@@ -544,6 +898,7 @@ final class SandboxVM: NSObject, VZVirtualMachineDelegate, @unchecked Sendable {
 
         consoleReadHandle?.readabilityHandler = nil
         consoleReadHandle = nil
+        stopAllPortForwards()
 
         if listenFD >= 0 {
             close(listenFD)

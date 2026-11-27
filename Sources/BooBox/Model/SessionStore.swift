@@ -242,6 +242,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published var vmState: VMState?
     @Published var bootTimeMs: Double?
     @Published var wasWarmPooled: Bool = false
+    @Published var forwardedVMPorts: [VMForwardedPort] = []
 
     var vmSocketPath: String?
     var attachBinaryPath: String?
@@ -565,12 +566,16 @@ final class SessionStore: ObservableObject {
             if session.wasWarmPooled {
                 session.bootTimeMs = 1
             }
+            session.forwardedVMPorts = vm.currentForwardedPorts
 
             vm.onStateChange = { [weak session] state in
                 session?.vmState = state
             }
             vm.onBootReady = { [weak session] ms in
                 session?.bootTimeMs = ms
+            }
+            vm.onForwardedPortsChange = { [weak session] ports in
+                session?.forwardedVMPorts = ports
             }
             attachPaneHandlers(pane, in: session)
 
@@ -1249,6 +1254,7 @@ final class SessionStore: ObservableObject {
         if session.wasWarmPooled {
             session.bootTimeMs = 1
         }
+        session.forwardedVMPorts = vm.currentForwardedPorts
         session.rootNode = .leaf(freshPane)
         session.focusedPaneID = freshPane.id
         session.refreshMirroredState()
@@ -1258,6 +1264,9 @@ final class SessionStore: ObservableObject {
         }
         vm.onBootReady = { [weak session] ms in
             session?.bootTimeMs = ms
+        }
+        vm.onForwardedPortsChange = { [weak session] ports in
+            session?.forwardedVMPorts = ports
         }
 
         stageView.rebuildSession(session)

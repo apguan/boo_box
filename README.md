@@ -17,7 +17,7 @@ Running autonomous coding agents directly in an unsandboxed terminal gives promp
 `boo_box` provides **local, zero-Docker agent guardrails** at native Ghostty Metal GPU speed:
 - **Three execution modes in one terminal:**
   1. **macOS Sandbox (default, `⌘T` / `boo .`):** Kernel-enforced macOS Seatbelt (`sandbox-exec`) with a per-session `$HOME` (`~/boo_box/sessions/<id>/`) and **~20 ms $O(1)$ Instant CoW Overlay** (`boobox-overlay`) — or optional APFS `clonefile(2)` snapshot (`boobox-clone`). Agents can edit or `rm -rf` freely without ever modifying your real repo or host files.
-  2. **Private Linux MicroVM (`⇧⌘N`):** Ephemeral Apple Silicon `arm64` Linux microVM via Apple's `Virtualization.framework` (`vmlinux-arm64` + APFS-cloned Alpine `rootfs.ext4`, 1-slot warm VM pool, multi-PTY over `vsock` via `boobox-attach`, plus native **`Dockerfile` / `Containerfile` recognition & setup** with zero Docker daemon required). Zero Mac filesystem access by default; wiped on close.
+  2. **Private Linux MicroVM (`⇧⌘N`):** Ephemeral Apple Silicon `arm64` Linux microVM via Apple's `Virtualization.framework` (`vmlinux-arm64` + APFS-cloned Alpine `rootfs.ext4`, 1-slot warm VM pool, multi-PTY over `vsock:5123`, automatic per-VM **`vsock:5124` TCP port forwarding** with zero port collisions even in `Offline` mode, and native **`Dockerfile` / `Containerfile` setup** with zero Docker daemon required). Zero Mac filesystem access by default; wiped on close.
   3. **Raw Host Shell (`⌥⌘T`):** Explicit unsandboxed escape hatch with an unmistakable red warning header.
 - **Seatbelt-Denied Host Vault & Egress Proxy Sidecar (`boobox-proxy`):**
   - Real API keys, GitHub tokens, and OAuth credentials stay **only on the host** in the Seatbelt-denied **Host Vault** (`~/boo_box/vault/`, `0700`/`0600`, zero Keychain ACL prompts across rebuilds/updates) or **1Password (`op://`)** — never written to `config.json` or sandbox files.
@@ -77,7 +77,7 @@ flowchart TB
   end
 
   GK -->|"Mode 1: ⌘T / boo ."| PTYD -->|"sandbox-exec (.sandbox.sb)"| SB["macOS Seatbelt Sandbox<br/>Per-session HOME + .boobox-bin shims (git/gh/rm/cp/mktemp)<br/>Per-process rlimits/nice + preexec hot-reload"]
-  GK -->|"Mode 2: ⇧⌘N"| VM["Private Linux MicroVM (Virtualization.framework)<br/>arm64 Linux + APFS-cloned rootfs.ext4<br/>boobox-attach ↔ vsock:5123"]
+  GK -->|"Mode 2: ⇧⌘N"| VM["Private Linux MicroVM (Virtualization.framework)<br/>arm64 Linux + APFS-cloned rootfs.ext4<br/>PTY vsock:5123 · Auto Port-Forward vsock:5124"]
   GK -->|"Mode 3: ⌥⌘T"| RAW["Raw Host Shell (red warning chrome)"]
 
   SB <-->|"Kernel NFSv3 mount (localhost port Seatbelt-blocked)"| OVL

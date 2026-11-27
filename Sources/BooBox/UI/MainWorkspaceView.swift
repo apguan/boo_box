@@ -625,6 +625,10 @@ private struct SessionHeaderBar: View {
                                 .fill(vmStatusColor.opacity(0.11))
                         )
                         .help(vmTooltip)
+
+                    if session.mode.isLinuxVM && !session.forwardedVMPorts.isEmpty {
+                        vmForwardedPortsBar(session.forwardedVMPorts)
+                    }
                 }
 
                 Spacer(minLength: 8)
@@ -779,6 +783,91 @@ private struct SessionHeaderBar: View {
         case .provisioning: return "Running Private VM startup script (/var/log/boobox-setup.log)"
         case .failed(let msg): return "VM error: \(msg)"
         default: return "Private Linux microVM (Virtualization.framework) — zero Mac access, wiped on close"
+        }
+    }
+
+    @ViewBuilder
+    private func vmForwardedPortsBar(_ ports: [VMForwardedPort]) -> some View {
+        let blueAccent = Color(red: 0.38, green: 0.72, blue: 1.0)
+        if ports.count <= 2 {
+            ForEach(ports) { fwd in
+                Button {
+                    if let url = URL(string: fwd.localURLString) {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("\(fwd.guestPort)→:\(fwd.hostPort)")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 8.5, weight: .semibold))
+                    }
+                    .foregroundStyle(blueAccent)
+                    .padding(.horizontal, 6.5)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(blueAccent.opacity(0.12))
+                            .overlay(Capsule().strokeBorder(blueAccent.opacity(0.28), lineWidth: 0.5))
+                    )
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button("Open \(fwd.localURLString) in Browser") {
+                        if let url = URL(string: fwd.localURLString) { NSWorkspace.shared.open(url) }
+                    }
+                    Button("Copy Local URL") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(fwd.localURLString, forType: .string)
+                    }
+                }
+                .help("VM port \(fwd.guestPort) forwarded over vsock → \(fwd.localURLString) (click to open in browser)")
+            }
+        } else {
+            let first = ports[0]
+            Button {
+                if let url = URL(string: first.localURLString) {
+                    NSWorkspace.shared.open(url)
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Text("\(first.guestPort)→:\(first.hostPort)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 8.5, weight: .semibold))
+                }
+                .foregroundStyle(blueAccent)
+                .padding(.horizontal, 6.5)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(blueAccent.opacity(0.12))
+                        .overlay(Capsule().strokeBorder(blueAccent.opacity(0.28), lineWidth: 0.5))
+                )
+            }
+            .buttonStyle(.plain)
+            .help("VM port \(first.guestPort) forwarded over vsock → \(first.localURLString)")
+
+            Menu {
+                ForEach(ports) { fwd in
+                    Button("Port \(fwd.guestPort) → \(fwd.localURLString)") {
+                        if let url = URL(string: fwd.localURLString) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            } label: {
+                Text("+\(ports.count - 1) ports ▾")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(blueAccent)
+                    .padding(.horizontal, 6.5)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(blueAccent.opacity(0.12)))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("All forwarded Private VM ports")
         }
     }
 
